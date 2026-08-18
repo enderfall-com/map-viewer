@@ -16,6 +16,11 @@ function keyOf(c: ChunkKey): string {
   return `${c.x},${c.z}`;
 }
 
+/** Chunks per heights request. Matches the server's own per-request cap
+ * (maxHeightChunks), so a queue larger than one page is split rather than
+ * rejected wholesale. */
+const HEIGHT_BATCH_MAX = 1024;
+
 /** Minimum depth of the selection volume, for the case where every member
  * sits at the same elevation and the terrain-derived depth would be zero --
  * a box with no height at all reads as a flat decal rather than a volume. */
@@ -78,6 +83,9 @@ export class SelectionLayer extends Layer {
    * entries fall back to the reference plane until the fetch resolves. */
   private readonly groundY = new Map<string, number>();
   private readonly pendingGroundY = new Set<string>();
+  /** Chunks waiting to go out in the next batched heights request. */
+  private queuedGroundY: ChunkKey[] = [];
+  private groundFlushTimer: number | null = null;
 
   constructor(engine: MapEngine, api: ApiClient) {
     super({ zIndex: 26 });
@@ -122,6 +130,7 @@ export class SelectionLayer extends Layer {
   clear(): void {
     this.groundY.clear();
     this.pendingGroundY.clear();
+    this.queuedGroundY = [];
     if (this.selected.size === 0) return;
     this.selected.clear();
     this.emitChange();
@@ -133,7 +142,7 @@ export class SelectionLayer extends Layer {
     if (this.selected.has(k)) this.selected.delete(k);
     else {
       this.selected.set(k, c);
-      this.ensureGroundY(c);
+      this.ensureGroundY([c]);
     }
     this.emitChange();
   }
@@ -146,7 +155,7 @@ export class SelectionLayer extends Layer {
     const prevKey = this.hoverChunk ? keyOf(this.hoverChunk) : null;
     if (nextKey === prevKey) return;
     this.hoverChunk = c;
-    if (c) this.ensureGroundY(c);
+    if (c) this.ensureGroundY([c]);
     this.changed();
   }
 
@@ -175,44 +184,72 @@ export class SelectionLayer extends Layer {
 
   /** Adds every chunk in an inclusive chunk-coordinate range. */
   addRange(minX: number, minZ: number, maxX: number, maxZ: number): void {
+    const added: ChunkKey[] = [];
     for (let z = minZ; z <= maxZ; z++) {
       for (let x = minX; x <= maxX; x++) {
         const c = { x, z };
         this.selected.set(keyOf(c), c);
-        this.ensureGroundY(c);
+        added.push(c);
       }
     }
+    // One call for the whole range, so the entire rectangle costs a single
+    // heights request rather than one per chunk.
+    this.ensureGroundY(added);
     this.emitChange();
   }
 
   /**
-   * Fetches the real terrain surface elevation under one chunk's centre, so
-   * the isometric box can sit flush with the ground instead of floating on
-   * the flat reference plane. A no-op once cached (or already in flight) --
-   * the ground doesn't move, so this only ever needs to happen once per
-   * chunk per dimension.
+   * Queues chunks whose terrain elevation isn't known yet, so the isometric
+   * volume can sit in the ground instead of on an arbitrary flat plane.
+   *
+   * Nothing is requested immediately: the queue is flushed once at the end of
+   * the current task, which coalesces a whole gesture into a single request.
+   * Committing a 12x12 selection calls this 144 times in one loop and issues
+   * exactly one round trip. Chunks already cached or already in flight are
+   * skipped -- terrain doesn't move, so each chunk is fetched once per
+   * dimension.
    */
-  private ensureGroundY(c: ChunkKey): void {
-    const key = keyOf(c);
-    if (this.groundY.has(key) || this.pendingGroundY.has(key)) return;
-    this.pendingGroundY.add(key);
+  private ensureGroundY(chunks: readonly ChunkKey[]): void {
+    for (const c of chunks) {
+      const key = keyOf(c);
+      if (this.groundY.has(key) || this.pendingGroundY.has(key)) continue;
+      this.pendingGroundY.add(key);
+      this.queuedGroundY.push(c);
+    }
+    if (this.queuedGroundY.length === 0 || this.groundFlushTimer !== null) return;
+    this.groundFlushTimer = window.setTimeout(() => {
+      this.groundFlushTimer = null;
+      void this.flushGroundY();
+    }, 0);
+  }
+
+  /** Sends every queued chunk as one request (paged, on the off chance a
+   * caller queues more than the server accepts at once). */
+  private async flushGroundY(): Promise<void> {
+    const queued = this.queuedGroundY;
+    this.queuedGroundY = [];
+    if (queued.length === 0) return;
+
     const dimension = this.engine.getDimension().id;
-    const cx = c.x * CHUNK_SIZE + CHUNK_SIZE / 2;
-    const cz = c.z * CHUNK_SIZE + CHUNK_SIZE / 2;
-    this.api
-      .pickTop(dimension, cx, cz, null)
-      .then((res) => {
-        this.pendingGroundY.delete(key);
-        // The dimension may have changed while this was in flight -- a block
-        // Y from the old one would be meaningless (and likely wrong) here.
+    try {
+      for (let i = 0; i < queued.length; i += HEIGHT_BATCH_MAX) {
+        const page = queued.slice(i, i + HEIGHT_BATCH_MAX);
+        const heights = await this.api.chunkHeights(dimension, page);
+        // The dimension may have changed while this was in flight; an
+        // elevation from the previous world means nothing in this one.
         if (this.engine.getDimension().id !== dimension) return;
-        if (!res) return;
-        this.groundY.set(key, (res.found ? res.y : this.engine.referenceY()) + 1);
-        this.changed();
-      })
-      .catch(() => {
-        this.pendingGroundY.delete(key);
-      });
+        const fallback = this.engine.referenceY();
+        for (const h of heights) {
+          // +1 for the block-top convention the projection expects.
+          this.groundY.set(`${h.x},${h.z}`, (h.found ? h.y : fallback) + 1);
+        }
+        if (heights.length > 0) this.changed();
+      }
+    } finally {
+      // Cleared either way, so a failed batch can be retried by whatever
+      // gesture next touches those chunks rather than being stuck pending.
+      for (const c of queued) this.pendingGroundY.delete(keyOf(c));
+    }
   }
 
   /** The map-space ring (closed, 4 points) of one chunk's top face, used in

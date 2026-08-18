@@ -1,5 +1,6 @@
 import type {
   Area,
+  ChunkHeight,
   ChunkRef,
   ClientConfig,
   DimensionInfo,
@@ -138,6 +139,27 @@ export class ApiClient {
     const { status, data } = await this.post('/api/chunks/forceload', { dimension, chunks, loaded });
     if (status === 200) return { ok: true, value: undefined };
     return { ok: false, message: this.errorMessage(status, data) };
+  }
+
+  /**
+   * Resolves a batch of chunks to one representative ground level each.
+   *
+   * One request for the whole set rather than a pick per chunk: a full 12x12
+   * chunk selection is 144 chunks, and asking individually spends 144 round
+   * trips on something the server answers in a single pass. A POST only
+   * because the chunk list belongs in a body rather than a query string --
+   * this reads world data and changes nothing.
+   *
+   * Returns an empty array rather than throwing when the request fails, since
+   * every caller can fall back to the reference plane and a missing overlay
+   * elevation is not worth surfacing as an error.
+   */
+  async chunkHeights(dimension: string, chunks: ChunkRef[]): Promise<ChunkHeight[]> {
+    const { status, data } = await this.post('/api/chunks/heights', { dimension, chunks });
+    if (status !== 200 || !isRecord(data)) return [];
+    return asArray<ChunkHeight>(data.heights).filter(
+      (h) => isRecord(h) && typeof h.x === 'number' && typeof h.z === 'number' && typeof h.y === 'number',
+    );
   }
 
   /** Loads the bootstrap configuration. */

@@ -155,6 +155,21 @@ export interface PickResult {
   found: boolean;
 }
 
+/**
+ * One chunk's representative ground level, from `POST /api/chunks/heights`.
+ *
+ * The server reduces the chunk's 256 columns to a single level low enough to
+ * sit under tree canopy, so this is the terrain the chunk rests on rather
+ * than whatever happens to stand on it. `found` is false for a chunk that has
+ * never been generated, whose `y` carries no meaning.
+ */
+export interface ChunkHeight {
+  x: number;
+  z: number;
+  y: number;
+  found: boolean;
+}
+
 /** A tile whose revision changed, as delivered over the realtime channel. */
 export interface TileRevision {
   mode: string;

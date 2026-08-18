@@ -107,6 +107,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /api/blocks/unknown", s.handleUnknownBlocks)
 	mux.HandleFunc("GET /api/skin/{uuid}", s.handleSkin)
+	// POST purely because the chunk list is a request body rather than a
+	// query string; this reads world data and changes nothing.
+	mux.HandleFunc("POST /api/chunks/heights", s.handleChunkHeights)
 
 	// Ingestion: a server plugin pushing real player positions and features.
 	// Every handler enforces its own bearer-token check, since it is disabled
