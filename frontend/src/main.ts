@@ -55,6 +55,15 @@ const MAX_CHUNK_SELECTION = MAX_DRAG_CHUNKS * MAX_DRAG_CHUNKS;
  * actually make out their model, not just land somewhere in view. */
 const FOLLOW_ZOOM = 8;
 
+/** Y levels between adjacent positions of the slice slider, and how long the
+ * drag must settle before the slice is applied. Both exist because a sliced
+ * isometric tile is rendered from voxel data on demand rather than served from
+ * the stored pyramid: coarse steps keep the number of distinct variants small,
+ * and the delay means one drag costs one render pass instead of one per
+ * intermediate level. */
+const SLICE_STEP = 4;
+const SLICE_DEBOUNCE_MS = 250;
+
 /** True when none of Ctrl/Cmd/Alt are held, so a bare-letter shortcut never
  * fights a browser or OS combination that happens to share the same key
  * (Ctrl+F find, Ctrl+S save, Ctrl+A select-all, and so on). */
@@ -761,6 +770,10 @@ async function boot(): Promise<void> {
   sliceInput.min = String(dimension.minY);
   sliceInput.max = String(dimension.maxY);
   sliceInput.value = String(dimension.maxY);
+  // Coarse steps on purpose. Each distinct level is a tile variant the server
+  // renders from voxel data on demand, so stepping by 1 through a 384-level
+  // range would ask for hundreds of full re-renders during a single drag.
+  sliceInput.step = String(SLICE_STEP);
   sliceInput.title = 'Cut the view off above this Y level';
   sliceWrap.append(sliceLabel, sliceInput);
 
@@ -802,20 +815,35 @@ async function boot(): Promise<void> {
   }
   updateCompass();
 
-  /** The slider sits at the dimension ceiling when nothing is being cut, so
-   * "no slice" and "slice at the very top" are the same position. */
+  /**
+   * The slider sits at the dimension ceiling when nothing is being cut, so
+   * "no slice" and "slice at the very top" are the same position.
+   *
+   * Reads the input rather than the engine so the readout tracks the handle
+   * during a drag, while the far more expensive re-render waits for the drag
+   * to settle.
+   */
   function updateSliceLabel(): void {
-    const y = engine.getSliceY();
-    sliceLabel.textContent = y === null ? 'Y ALL' : `Y ${y}`;
+    const y = Number(sliceInput.value);
+    sliceLabel.textContent = y >= engine.getDimension().maxY ? 'Y ALL' : `Y ${y}`;
   }
   updateSliceLabel();
 
+  // Debounced because a sliced tile is rendered on demand from voxel data:
+  // applying every intermediate value of a drag would queue hundreds of
+  // renders and leave the level the user actually chose stuck behind them.
+  let sliceTimer: number | null = null;
   sliceInput.addEventListener('input', () => {
-    const y = Number(sliceInput.value);
-    // At or above the ceiling nothing is cut away, so drop the slice entirely
-    // and let the view go back to the ordinary stored tiles.
-    engine.setSliceY(y >= engine.getDimension().maxY ? null : y);
     updateSliceLabel();
+    if (sliceTimer !== null) window.clearTimeout(sliceTimer);
+    sliceTimer = window.setTimeout(() => {
+      sliceTimer = null;
+      const y = Number(sliceInput.value);
+      // At or above the ceiling nothing is cut away, so drop the slice
+      // entirely and let the view go back to the ordinary stored tiles.
+      engine.setSliceY(y >= engine.getDimension().maxY ? null : y);
+      flashLoading();
+    }, SLICE_DEBOUNCE_MS);
   });
 
   // Re-range the slider when the dimension changes: the Nether's ceiling and a

@@ -477,7 +477,23 @@ func (m *Manager) attachVolume(ctx context.Context, req Request, dim world.Dimen
 	// Subtracting IsoVoxelMaxDepth covers the deepest a per-chunk slab could
 	// ever reach, so the basement skirt fallback never has to activate for
 	// terrain still within the tightened window.
-	bounds := iso.Proj.WorldFootprint(mcmath.IsoTileBounds(req.Pos), lo-m.Cfg.IsoVoxelMaxDepth, hi).Expand(1)
+	loEff := lo - m.Cfg.IsoVoxelMaxDepth
+	hiEff := hi
+	// Under a Y slice the band stops at the cut. Elevation is what makes the
+	// isometric footprint wide -- every Y level shifts terrain another block
+	// along the view ray -- so a tile sliced at Y=64 through terrain reaching
+	// Y=200 was loading the voxel slabs of a footprint sized for 136 levels of
+	// terrain it then discarded. Those chunks cannot project into this tile at
+	// all once everything above the cut is gone.
+	if req.Sliced && req.SliceY < hiEff {
+		hiEff = req.SliceY
+	}
+	// A slice below every surface in the window leaves only the columns whose
+	// slabs reach under it; the band must stay non-empty to still cover them.
+	if hiEff < loEff {
+		hiEff = loEff
+	}
+	bounds := iso.Proj.WorldFootprint(mcmath.IsoTileBounds(req.Pos), loEff, hiEff).Expand(1)
 
 	var chunkErrs int
 	vol, err := world.AssembleVolume(ctx, m.Provider, req.Dimension, bounds, dim.MinY, dim.MaxY,
