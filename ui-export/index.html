@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <meta name="color-scheme" content="dark" />
+    <title>Minecraft Map -- UI shell (static export)</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <!--
+      This is a self-contained mirror of the real app's UI CHROME ONLY --
+      the actual map (OpenLayers + a Go tile server + a real Minecraft world)
+      isn't reproduced here. `.mm-map` below is a fake pixel-terrain
+      background (pure CSS) standing in for it, and every control is wired up
+      with plausible fake data in app.js -- no network calls, nothing to run.
+
+      Open this file directly in a browser. Everything -- dropdowns, the
+      mode switch, chunk selection, the right-click menu, search, keyboard
+      shortcuts -- is functional so the interaction design can be judged, not
+      just the visuals. Look at app.js for exactly what's faked vs real.
+    -->
+    <div id="app">
+      <div class="mm-shell">
+        <div class="mm-map" id="fakeMap">
+          <div class="mm-fake-terrain" id="fakeTerrain"></div>
+          <div class="mm-fake-grid" id="fakeGrid"></div>
+
+          <!-- Zoom controls -->
+          <div class="mm-zoom">
+            <button class="mm-zoom-btn" id="zoomIn" title="Zoom in"></button>
+            <button class="mm-zoom-btn" id="zoomOut" title="Zoom out"></button>
+            <button class="mm-zoom-btn mm-home" id="homeBtn" title="Go to spawn"></button>
+          </div>
+
+          <!-- Selection panel (shown while selection mode is on) -->
+          <div class="mm-selection mm-panel" id="selectionPanel" hidden>
+            <div class="mm-selection-count" id="selectionCount">0 chunks selected</div>
+            <input class="mm-selection-owner" id="ownerInput" type="text" placeholder="Owner name (optional)" autocomplete="off" />
+            <div class="mm-selection-actions">
+              <button class="mm-selection-btn mm-claim" id="claimBtn" type="button" title="Claim selected chunks (C)">Claim</button>
+              <button class="mm-selection-btn" id="unclaimBtn" type="button" title="Unclaim selected chunks (U)">Unclaim</button>
+              <button class="mm-selection-btn mm-forceload" id="forceLoadBtn" type="button" title="Force-load selected chunks (F)">Force Load</button>
+              <button class="mm-selection-btn" id="unloadBtn" type="button" title="Stop force-loading selected chunks (L)">Unload</button>
+            </div>
+            <div class="mm-selection-error" id="selectionError" hidden></div>
+            <button class="mm-selection-clear" id="clearSelectionBtn" type="button">Clear selection</button>
+            <div class="mm-selection-hint">
+              Click, shift/ctrl+click, or shift/right-drag to multi-select &middot; C/U/F/L to act &middot; A selects the view
+            </div>
+          </div>
+        </div>
+
+        <!-- Header: floats over the map as a HUD bar -->
+        <header class="mm-header mm-panel">
+          <div class="mm-brand">
+            <span class="mm-brand-mark" id="brandMark"></span>
+            <span class="mm-brand-name">EnderFall Map</span>
+          </div>
+
+          <div class="mm-dropdown mm-dim" id="dimDropdown">
+            <button class="mm-dropdown-btn" type="button" id="dimDropdownBtn">
+              <span class="mm-dropdown-label">New World</span>
+              <span class="mm-caret" id="dimCaret"></span>
+            </button>
+            <div class="mm-dropdown-panel mm-panel" id="dimDropdownPanel" hidden>
+              <button class="mm-item is-active" type="button" data-dim="New World">
+                <span class="mm-item-name">New World</span>
+                <span class="mm-item-sub">minecraft:overworld</span>
+              </button>
+              <button class="mm-item" type="button" data-dim="The Nether">
+                <span class="mm-item-name">The Nether</span>
+                <span class="mm-item-sub">minecraft:the_nether</span>
+              </button>
+              <button class="mm-item" type="button" data-dim="The End">
+                <span class="mm-item-name">The End</span>
+                <span class="mm-item-sub">minecraft:the_end</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="mm-segmented" id="modeSwitch">
+            <button class="mm-seg-btn is-active" type="button" data-mode="top">2D</button>
+            <button class="mm-seg-btn" type="button" data-mode="iso">ISO</button>
+          </div>
+
+          <div class="mm-dropdown mm-layers" id="layersDropdown">
+            <button class="mm-dropdown-btn" type="button" id="layersDropdownBtn">
+              <span class="mm-dropdown-label">Layers</span>
+              <span class="mm-caret" id="layersCaret"></span>
+            </button>
+            <div class="mm-dropdown-panel mm-panel" id="layersDropdownPanel" hidden>
+              <div class="mm-menu-title">Overlays</div>
+              <label class="mm-check"><input type="checkbox" checked data-layer="players" /><span>Players</span></label>
+              <label class="mm-check"><input type="checkbox" checked data-layer="claims" /><span>Claims</span></label>
+              <label class="mm-check"><input type="checkbox" checked data-layer="regions" /><span>Regions</span></label>
+              <label class="mm-check"><input type="checkbox" checked data-layer="markers" /><span>Markers</span></label>
+              <label class="mm-check"><input type="checkbox" checked data-layer="forceLoaded" /><span>Force loaded</span></label>
+              <label class="mm-check"><input type="checkbox" data-layer="chunkGrid" /><span>Chunk grid</span></label>
+              <label class="mm-check"><input type="checkbox" data-layer="blockGrid" /><span>Block grid</span></label>
+              <label class="mm-check"><input type="checkbox" data-layer="worldBorder" /><span>World border</span></label>
+            </div>
+          </div>
+
+          <button class="mm-icon-btn mm-select-btn" id="selectBtn" type="button" title="Select chunks to claim, unclaim or force load (S)"></button>
+
+          <div class="mm-search" id="search">
+            <input class="mm-search-input" id="searchInput" type="search" placeholder="Search player, warp, or 1250 -8220" autocomplete="off" spellcheck="false" />
+            <div class="mm-search-results mm-panel" id="searchResults" hidden></div>
+          </div>
+
+          <button class="mm-icon-btn mm-fullscreen" id="fullscreenBtn" type="button" title="Fullscreen"></button>
+        </header>
+
+        <!-- Info panel (shown after a "pick") -->
+        <aside class="mm-info mm-panel" id="infoPanel" hidden>
+          <div class="mm-info-header">
+            <h2 class="mm-info-title">Block</h2>
+            <button class="mm-icon-btn" id="infoCloseBtn" type="button" title="Close"></button>
+          </div>
+          <div class="mm-info-body" id="infoBody"></div>
+        </aside>
+
+        <!-- Status bar: floats over the map at the bottom edge -->
+        <div class="mm-status mm-panel">
+          <span class="mm-status-item mm-mono" id="statusCoords">X: -   Z: -</span>
+          <span class="mm-status-item mm-mono" id="statusChunk">Chunk: -, -</span>
+          <span class="mm-status-item mm-dim-text" id="statusBiome"></span>
+          <span class="mm-spacer"></span>
+          <span class="mm-status-item mm-conn is-live">LIVE</span>
+          <span class="mm-status-item mm-mono" id="statusZoom">Zoom 4.00   4 blocks/px</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Context menu (right-click on the map) -->
+    <div class="mm-contextmenu mm-panel" id="contextMenu" hidden role="menu"></div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

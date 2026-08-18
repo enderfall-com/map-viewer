@@ -1,0 +1,22 @@
+{
+  "name": "minecraft-map-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "High-performance Minecraft web map: top-down + isometric tile rendering",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ol": "^10.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8"
+  }
+}

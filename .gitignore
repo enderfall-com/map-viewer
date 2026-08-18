@@ -1,0 +1,21 @@
+# Compiled server binary (built from backend/cmd/minecraft-map).
+/minecraft-map.exe
+/minecraft-map
+
+# Local operator configuration: contains absolute paths to this machine's
+# Minecraft installation, and may hold an ingest token. config.example.yml in
+# config/ is the tracked template.
+/config/config.yml
+
+# Generated tile pyramid -- large, fully reproducible from the world data.
+/config/data/
+/backend/data/
+/data/
+
+# Built frontend bundle, reproducible via `npm run build` in frontend/.
+/frontend/dist/
+
+node_modules/
+
+# Server logs.
+*.log
