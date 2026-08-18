@@ -74,6 +74,7 @@ export interface EngineEventMap {
   pointermove: Coordinate;
   click: ClickInfo;
   mode: MapMode;
+  camera: IsoCamera;
   style: string;
   dimension: DimensionInfo;
 }
@@ -89,7 +90,10 @@ export class MapEngine {
   readonly view: View;
   readonly projection: Projection;
   readonly config: ClientConfig;
-  readonly camera: IsoCamera;
+  /** The corner the isometric view is taken from. Mutable via
+   * {@link setCamera}; overlays read it every frame, so they follow a rotation
+   * without needing to be told about it. */
+  camera: IsoCamera;
 
   private readonly api: ApiClient;
   private readonly layers: Record<MapMode, TileLayer>;
@@ -273,7 +277,12 @@ export class MapEngine {
    */
   private tileUrl(mode: MapMode, z: number, x: number, y: number): string {
     const rev = this.revisions.get(`${mode}/${z}/${x}/${y}`) ?? this.baseRevision;
-    const styleQuery = this.style && this.style !== 'terrain' ? `?style=${encodeURIComponent(this.style)}` : '';
+    const params = new URLSearchParams();
+    if (this.style && this.style !== 'terrain') params.set('style', this.style);
+    // Only isometric has a viewing corner, and only a non-default one needs
+    // saying -- so the default view's URLs stay byte-identical to before
+    // rotation existed, and keep hitting tiles already cached under them.
+    if (mode === 'iso' && this.camera !== DEFAULT_CAMERA) params.set('cam', this.camera);
     const path = this.config.tileUrlTemplate
       .replace('{dimension}', encodeURIComponent(this.dimension.id))
       .replace('{mode}', mode)
@@ -281,7 +290,8 @@ export class MapEngine {
       .replace('{z}', String(z))
       .replace('{x}', String(x))
       .replace('{y}', String(y));
-    return `${path}${styleQuery}`;
+    const query = params.toString();
+    return query ? `${path}?${query}` : path;
   }
 
   // -------------------------------------------------------------------------
@@ -436,7 +446,10 @@ export class MapEngine {
   async pickAt(coord: Coordinate, key: string | null = 'pick') {
     if (this.mode === 'iso') {
       const [u, v] = mapToIso(coord[0], coord[1]);
-      return this.api.pickIso(this.dimension.id, u, v, key);
+      // The camera has to travel with the pick: the same (u, v) names a
+      // different world column from each corner, so a ray march against the
+      // wrong one would resolve a click to the wrong block entirely.
+      return this.api.pickIso(this.dimension.id, u, v, key, this.camera);
     }
     const [x, z] = mapToBlock(coord[0], coord[1]);
     return this.api.pickTop(this.dimension.id, Math.floor(x), Math.floor(z), key);
@@ -625,6 +638,58 @@ export class MapEngine {
       this.lastResolvedY = y;
     }
     this.emit('mode', mode);
+    this.emit('moveend');
+  }
+
+  /**
+   * Rotates the isometric view to a different corner.
+   *
+   * Every corner has its own map-coordinate space -- the same world column
+   * projects to a different (u, v) from each one -- so the centre has to be
+   * translated through world coordinates rather than left alone, exactly as
+   * {@link setMode} does between projections. The block at the centre is
+   * resolved against real terrain first (reusing the already-resolved centre
+   * when it is current) so the view stays put across a rotation instead of
+   * drifting by the elevation error.
+   *
+   * A no-op outside isometric mode, which has no viewing corner.
+   */
+  async setCamera(camera: IsoCamera): Promise<void> {
+    if (this.mode !== 'iso' || camera === this.camera) return;
+    const token = ++this.modeSwitchToken;
+    const centerCoord = this.view.getCenter() ?? [0, 0];
+
+    let x: number;
+    let z: number;
+    let y = this.referenceY();
+    const cached = this.resolvedCenter;
+    if (cached && cached.key === centerKey(centerCoord)) {
+      x = cached.x;
+      z = cached.z;
+      y = cached.y;
+    } else {
+      const pick = await this.pickAt(centerCoord, 'modeswitch').catch(() => null);
+      if (pick && pick.found) {
+        x = pick.x;
+        z = pick.z;
+        y = pick.water && pick.waterY !== undefined ? pick.waterY : pick.y;
+      } else {
+        [x, z] = this.viewToBlockApprox(centerCoord);
+      }
+    }
+    if (token !== this.modeSwitchToken) return; // superseded while awaiting the pick
+
+    this.camera = camera;
+    this.resolvedCenter = null;
+    // Every isometric tile URL now names a different camera, so the ones
+    // already loaded are for the previous corner and must be dropped.
+    this.sources.iso.refresh();
+
+    const newCenter = this.blockToView(x, z, y);
+    this.view.setCenter(newCenter);
+    this.resolvedCenter = { key: centerKey(newCenter), x, z, y };
+    this.lastResolvedY = y;
+    this.emit('camera', camera);
     this.emit('moveend');
   }
 

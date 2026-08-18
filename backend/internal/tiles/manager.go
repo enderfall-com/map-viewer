@@ -49,6 +49,22 @@ type Request struct {
 	Mode      Mode
 	Style     render.Style
 	Pos       mcmath.TilePos
+	// Camera is the corner an isometric tile is viewed from. Ignored in
+	// top-down mode, which has no viewing corner. Its zero value is
+	// mcmath.DefaultCamera, so a Request built without one renders the
+	// default view.
+	Camera mcmath.IsoCamera
+}
+
+// variant is the storage-path and cache-key component distinguishing tiles of
+// the same area rendered differently within one mode. Empty for anything that
+// matches the historical defaults, so those tiles keep their existing paths
+// and keys rather than being regenerated under new ones.
+func (r Request) variant() string {
+	if r.Mode == ModeIso && r.Camera != mcmath.DefaultCamera {
+		return r.Camera.String()
+	}
+	return ""
 }
 
 // storeKey builds the storage key for a request.
@@ -56,6 +72,7 @@ func (r Request) storeKey(format Format) cache.Key {
 	return cache.Key{
 		Dimension: cache.SafeID(r.Dimension),
 		Mode:      string(r.Mode),
+		Variant:   r.variant(),
 		Style:     string(r.Style),
 		Zoom:      r.Pos.Zoom,
 		X:         r.Pos.X,
@@ -71,6 +88,10 @@ func (r Request) cacheKey() string {
 	b.WriteString(r.Dimension)
 	b.WriteByte('|')
 	b.WriteString(string(r.Mode))
+	if v := r.variant(); v != "" {
+		b.WriteByte('_')
+		b.WriteString(v)
+	}
 	b.WriteByte('|')
 	b.WriteString(string(r.Style))
 	b.WriteByte('|')
@@ -370,7 +391,7 @@ func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.Dimen
 	var bounds mcmath.BlockBounds
 	var iso *render.Iso
 	if req.Mode == ModeIso {
-		iso = render.NewIso(sh, mcmath.DefaultCamera, m.Cfg.IsoEdgeSkirt)
+		iso = render.NewIso(sh, req.Camera, m.Cfg.IsoEdgeSkirt)
 		bounds = iso.SurfaceBounds(req.Pos, dim.MinY, dim.MaxY)
 	} else {
 		td := render.NewTopDown(sh)

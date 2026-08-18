@@ -295,6 +295,22 @@ func (s *Server) resolveDimension(ctx context.Context, raw string) (world.Dimens
 	return s.Provider.Dimension(ctx, id)
 }
 
+// isoCameraParam resolves the ?cam= query parameter to a viewing corner,
+// falling back to the configured default when absent.
+//
+// Requests carry the camera rather than the server dictating it from config,
+// because the client can rotate the view at will and a tile and the pick that
+// resolves a click on it have to agree about which corner they mean. The
+// config value remains the initial camera the client starts from.
+func (s *Server) isoCameraParam(r *http.Request) (mcmath.IsoCamera, bool) {
+	v := r.URL.Query().Get("cam")
+	if v == "" {
+		cam, _ := mcmath.ParseIsoCamera(s.Cfg.Render.IsoCamera)
+		return cam, true
+	}
+	return mcmath.ParseIsoCamera(v)
+}
+
 func intParam(r *http.Request, name string, def int) int {
 	v := r.URL.Query().Get(name)
 	if v == "" {
@@ -693,7 +709,11 @@ func (s *Server) handlePick(w http.ResponseWriter, r *http.Request) {
 	if mode == tiles.ModeIso {
 		u := floatParam(r, "u", 0)
 		v := floatParam(r, "v", 0)
-		cam, _ := mcmath.ParseIsoCamera(s.Cfg.Render.IsoCamera)
+		cam, camOK := s.isoCameraParam(r)
+		if !camOK {
+			writeError(w, http.StatusBadRequest, "unknown iso camera")
+			return
+		}
 		proj := mcmath.NewIsoProjection(cam)
 
 		// The ray can only reach columns inside the elevation band, so load a
@@ -885,11 +905,18 @@ func (s *Server) serveTile(w http.ResponseWriter, r *http.Request, dimRaw, modeR
 		return
 	}
 
+	cam, ok := s.isoCameraParam(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "unknown iso camera")
+		return
+	}
+
 	req := tiles.Request{
 		Dimension: dim.ID,
 		Mode:      mode,
 		Style:     style,
 		Pos:       mcmath.TilePos{Zoom: z, X: x, Y: y},
+		Camera:    cam,
 	}
 
 	data, err := s.Tiles.Tile(r.Context(), req, tiles.PriorityUser)

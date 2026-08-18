@@ -120,6 +120,17 @@ export const ICON_ISO = pixelIcon([
   '...#...',
 ]);
 
+/** A clockwise arrow, for rotating the isometric camera to the next corner. */
+export const ICON_ROTATE = pixelIcon([
+  '..###..',
+  '.#...#.',
+  '#..#..#',
+  '#.###.#',
+  '#..#..#',
+  '.#...#.',
+  '..###..',
+]);
+
 export const ICON_LAYERS = pixelIcon([
   '.######.',
   '.######.',

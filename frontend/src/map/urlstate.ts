@@ -1,3 +1,4 @@
+import { CAMERA_ORDER, DEFAULT_CAMERA, type IsoCamera } from '../coordinates/iso';
 import type { MapEngine, MapMode } from './engine';
 
 /** The shareable pieces of map state. */
@@ -8,6 +9,7 @@ export interface MapState {
   zoom: number;
   mode: MapMode;
   style?: string;
+  cam?: IsoCamera;
 }
 
 /**
@@ -47,6 +49,9 @@ export class UrlState {
     const style = p.get('style');
     if (style) out.style = style;
 
+    const cam = p.get('cam');
+    if (cam && (CAMERA_ORDER as readonly string[]).includes(cam)) out.cam = cam as IsoCamera;
+
     return out;
   }
 
@@ -56,6 +61,7 @@ export class UrlState {
     const schedule = () => this.scheduleWrite();
     engine.on('moveend', schedule);
     engine.on('mode', schedule);
+    engine.on('camera', schedule);
     engine.on('dimension', schedule);
     engine.on('style', schedule);
   }
@@ -81,6 +87,9 @@ export class UrlState {
     p.set('zoom', e.zoom().toFixed(2));
     p.set('mode', e.getMode());
     if (e.getStyle() && e.getStyle() !== 'terrain') p.set('style', e.getStyle());
+    // Only meaningful in isometric, and only worth spelling out when it isn't
+    // the corner a plain link already implies.
+    if (e.getMode() === 'iso' && e.camera !== DEFAULT_CAMERA) p.set('cam', e.camera);
 
     const url = `${window.location.pathname}?${p.toString()}`;
     window.history.replaceState(null, '', url);

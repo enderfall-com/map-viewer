@@ -10,6 +10,7 @@ import { RealtimeSocket, type ConnectionState } from './api/socket';
 import type { ClientConfig, DimensionInfo, PickResult, SearchResult } from './api/types';
 import { MapEngine, type MapMode } from './map/engine';
 import { blockToChunk } from './coordinates/mc';
+import { nextCamera, northBearingDeg, type IsoCamera } from './coordinates/iso';
 import { UrlState } from './map/urlstate';
 import { GridLayer } from './layers/grid';
 import { FeatureLayers } from './layers/features';
@@ -25,6 +26,7 @@ import {
   ICON_LAYERS,
   ICON_MINUS,
   ICON_PLUS,
+  ICON_ROTATE,
   ICON_SELECT,
 } from './controls/icons';
 import {
@@ -142,6 +144,15 @@ async function boot(): Promise<void> {
     engine.centerOnBlock(initial.x, initial.z, undefined, false);
   }
   if (initial.style) engine.setStyle(initial.style);
+  // The projection the link (or, failing that, the server's configuration)
+  // asked for. Restored before the first tiles are requested so the map does
+  // not load a full screen of the wrong projection and immediately discard it.
+  const initialMode: MapMode =
+    initial.mode ?? (config.defaultMode === 'iso' ? 'iso' : 'top');
+  if (initialMode === 'iso') {
+    await engine.setMode('iso');
+    if (initial.cam) await engine.setCamera(initial.cam);
+  }
 
   // ---- Debug HUD (1,1) -----------------------------------------------------
 
@@ -703,26 +714,56 @@ async function boot(): Promise<void> {
     }
   }
 
+  /**
+   * Rotates the isometric view a quarter turn.
+   *
+   * Overlays are reprojected afterwards for the same reason a mode switch
+   * does it: every corner is its own map-coordinate space, so a marker's old
+   * position now names a different place entirely.
+   */
+  async function rotateView(camera: IsoCamera): Promise<void> {
+    if (modeSwitchBusy) return;
+    modeSwitchBusy = true;
+    try {
+      await engine.setCamera(camera);
+    } catch {
+      /* the engine keeps the previous camera on failure */
+    } finally {
+      modeSwitchBusy = false;
+      features.reproject();
+      players.reproject();
+      border.rebuild();
+      selection.clear();
+    }
+  }
+
   // ---- Compass, scale bar, zoom, spawn (3,3) --------------------------------
 
   const rightCol = el('div', 'mm-right-col');
   const compass = el('div', 'mm-compass');
-  compass.append(el('span', 'mm-compass-n', 'N'), el('span', 'mm-compass-needle'));
+  // The needle and its label rotate together, so "N" always sits at the head
+  // of the arrow rather than drifting away from it.
+  const compassDial = el('div', 'mm-compass-dial');
+  // "N" above the up-pointing arrowhead, so the label sits at the tip.
+  compassDial.append(el('span', 'mm-compass-n', 'N'), el('span', 'mm-compass-needle'));
+  compass.append(compassDial);
   const scaleBar = el('div', 'mm-scalebar');
   const scaleBarLine = el('span', 'mm-scalebar-line');
   const scaleBarLabel = el('span', 'mm-scalebar-label mm-mono');
   scaleBar.append(scaleBarLine, scaleBarLabel);
+  const rotateBtn = el('button', 'mm-zoom-btn');
   const zoomIn = el('button', 'mm-zoom-btn');
   const zoomOut = el('button', 'mm-zoom-btn');
   const homeBtn = el('button', 'mm-zoom-btn');
+  rotateBtn.innerHTML = ICON_ROTATE;
   zoomIn.innerHTML = ICON_PLUS;
   zoomOut.innerHTML = ICON_MINUS;
   homeBtn.innerHTML = ICON_HOME;
-  zoomIn.type = zoomOut.type = homeBtn.type = 'button';
+  rotateBtn.type = zoomIn.type = zoomOut.type = homeBtn.type = 'button';
   zoomIn.title = 'Zoom in';
   zoomOut.title = 'Zoom out';
   homeBtn.title = 'Go to spawn';
-  rightCol.append(compass, scaleBar, zoomIn, zoomOut, homeBtn);
+  rightCol.append(compass, scaleBar, rotateBtn, zoomIn, zoomOut, homeBtn);
   chrome.appendChild(rightCol);
 
   function updateScaleBar(): void {
@@ -731,6 +772,25 @@ async function boot(): Promise<void> {
   }
   updateScaleBar();
 
+  /**
+   * Points the compass at real north and offers rotation only where it means
+   * something. North is straight up in plan view, but in isometric it depends
+   * on the viewing corner, so the dial is driven by the projection itself.
+   */
+  function updateCompass(): void {
+    const iso = engine.getMode() === 'iso';
+    const bearing = iso ? northBearingDeg(engine.camera) : 0;
+    compassDial.style.transform = `rotate(${bearing.toFixed(1)}deg)`;
+    rotateBtn.hidden = !iso;
+    if (iso) {
+      rotateBtn.title = `Rotate view (${engine.camera.toUpperCase()} → ${nextCamera(engine.camera).toUpperCase()})`;
+    }
+  }
+  updateCompass();
+
+  rotateBtn.addEventListener('click', () => {
+    void rotateView(nextCamera(engine.camera)).then(flashLoading);
+  });
   zoomIn.addEventListener('click', () => {
     engine.zoomBy(1);
     flashLoading();
@@ -789,6 +849,10 @@ async function boot(): Promise<void> {
   engine.on('moveend', () => {
     void refreshFeatures();
   });
+
+  // Both change where north is on screen, and whether rotating means anything.
+  engine.on('mode', updateCompass);
+  engine.on('camera', updateCompass);
 
   /**
    * Cursor readout.

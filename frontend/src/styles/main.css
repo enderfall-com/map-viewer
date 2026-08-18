@@ -904,6 +904,18 @@ button {
   height: 38px;
 }
 
+/* Rotated as one piece so the "N" stays attached to the arrowhead. In
+   isometric mode north is not up -- the bearing comes from the projection for
+   the active camera, so the dial cannot disagree with the terrain. */
+.mm-compass-dial {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  transition: transform 160ms ease;
+}
+
 .mm-compass-n {
   font-family: var(--font-pixel);
   font-size: 9px;

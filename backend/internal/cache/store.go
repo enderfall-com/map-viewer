@@ -29,10 +29,16 @@ var ErrNotFound = errors.New("tile not found")
 type Key struct {
 	Dimension string // already sanitised, e.g. "minecraft_overworld"
 	Mode      string // "top" or "iso"
-	Style     string // "terrain", "biome", "height"
-	Zoom      int
-	X, Y      int
-	Format    string // "webp" or "png"
+	// Variant distinguishes tiles of the same area rendered a different way
+	// within one mode -- currently the isometric camera corner, where "" means
+	// the default corner. Empty leaves the path exactly as it was before
+	// variants existed, so the default view keeps using tiles already on disk
+	// instead of regenerating a whole pyramid under a new name.
+	Variant string
+	Style   string // "terrain", "biome", "height"
+	Zoom    int
+	X, Y    int
+	Format  string // "webp" or "png"
 }
 
 // Path returns the store-relative path for a tile.
@@ -43,9 +49,13 @@ type Key struct {
 // Negative components are grouped under a "-" prefixed directory so a single
 // directory never mixes signs, which keeps listings tidy for very large worlds.
 func (k Key) Path() string {
+	mode := k.Mode
+	if k.Variant != "" {
+		mode += "_" + k.Variant
+	}
 	return filepath.Join(
 		k.Dimension,
-		k.Mode,
+		mode,
 		k.Style,
 		strconv.Itoa(k.Zoom),
 		// Sharding by X keeps any one directory to a manageable entry count even

@@ -31,8 +31,35 @@ export const ISO_BLOCK_HEIGHT = 1.0;
 /** The four diagonal viewing directions, named by the corner the camera sits over. */
 export type IsoCamera = 'se' | 'sw' | 'nw' | 'ne';
 
-/** The camera direction the tile pipeline renders today. */
+/** The camera direction the view starts from. */
 export const DEFAULT_CAMERA: IsoCamera = 'se';
+
+/**
+ * The four corners in the order a rotate control steps through them, so each
+ * press turns the world a quarter turn the same way round.
+ */
+export const CAMERA_ORDER: readonly IsoCamera[] = ['se', 'sw', 'nw', 'ne'];
+
+/** The corner one quarter turn on from `cam`. */
+export function nextCamera(cam: IsoCamera): IsoCamera {
+  const i = CAMERA_ORDER.indexOf(cam);
+  return CAMERA_ORDER[(i + 1) % CAMERA_ORDER.length];
+}
+
+/**
+ * Where world north points on screen, in degrees clockwise from straight up.
+ *
+ * Isometric north is never simply "up": under a 2:1 dimetric projection from
+ * the default corner it runs up and to the right, and each rotation moves it
+ * again. Derived from the projection itself rather than hard-coded per corner,
+ * so a compass built on it cannot disagree with the terrain it labels.
+ */
+export function northBearingDeg(cam: IsoCamera): number {
+  const [u0, v0] = project(cam, 0, 0, 0);
+  // North is -Z in Minecraft. `v` grows downward, matching screen Y.
+  const [u1, v1] = project(cam, 0, 0, -1);
+  return (Math.atan2(u1 - u0, v0 - v1) * 180) / Math.PI;
+}
 
 /** Maps world X/Z onto the camera's depth axes. A signed axis swap, so exact. */
 export function rotate(cam: IsoCamera, x: number, z: number): [number, number] {
