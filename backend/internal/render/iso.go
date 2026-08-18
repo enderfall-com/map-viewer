@@ -53,6 +53,21 @@ type Iso struct {
 	// below is used unchanged; callers set this only when voxel rendering is
 	// enabled and the active world provider actually supports it.
 	Volume *world.Volume
+
+	// Sliced enables SliceY. Kept as a separate flag rather than encoding
+	// "no slice" as a sentinel Y, because Y=0 is an ordinary slice level and
+	// an Iso built as a struct literal (as the tests do) must default to
+	// drawing whole columns.
+	Sliced bool
+
+	// SliceY, when Sliced, is the highest Y level drawn: everything above it
+	// is treated as air, cutting the world open so caves and building
+	// interiors are visible from above.
+	//
+	// Only the voxel path can honour this. The heightmap renderer knows a
+	// single surface height per column and nothing about what is underneath,
+	// so there is nothing there to reveal.
+	SliceY int
 }
 
 // NewIso builds an isometric renderer for a camera direction. edgeSkirt <= 0

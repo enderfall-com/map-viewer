@@ -54,6 +54,14 @@ type Request struct {
 	// mcmath.DefaultCamera, so a Request built without one renders the
 	// default view.
 	Camera mcmath.IsoCamera
+
+	// Sliced and SliceY cut the isometric view off above a Y level, exposing
+	// caves and interiors. Sliced tiles are never written to the tile store:
+	// there is one variant per level per camera, which would multiply a
+	// world's pyramid by hundreds for a control the user drags through
+	// continuously. They live in the memory cache only.
+	Sliced bool
+	SliceY int
 }
 
 // variant is the storage-path and cache-key component distinguishing tiles of
@@ -94,6 +102,13 @@ func (r Request) cacheKey() string {
 	}
 	b.WriteByte('|')
 	b.WriteString(string(r.Style))
+	// In the memory key but deliberately not in variant()/the store path: a
+	// sliced tile must not collide with the unsliced one, but must not be
+	// persisted either.
+	if r.Sliced {
+		b.WriteString("|y")
+		b.WriteString(strconv.Itoa(r.SliceY))
+	}
 	b.WriteByte('|')
 	b.WriteString(strconv.Itoa(r.Pos.Zoom))
 	b.WriteByte('/')
@@ -299,11 +314,14 @@ func (m *Manager) Tile(ctx context.Context, req Request, prio Priority) ([]byte,
 	if data, ok := m.memory.Get(key); ok {
 		return data, nil
 	}
-	if data, err := m.Store.Get(ctx, req.storeKey(m.Cfg.Format)); err == nil {
-		m.memory.Put(key, data, int64(len(data)))
-		return data, nil
-	} else if !errors.Is(err, cache.ErrNotFound) {
-		m.Log.Warn("tile store read failed", "key", key, "error", err)
+	// Sliced tiles are never stored, so there is nothing on disk to look for.
+	if !req.Sliced {
+		if data, err := m.Store.Get(ctx, req.storeKey(m.Cfg.Format)); err == nil {
+			m.memory.Put(key, data, int64(len(data)))
+			return data, nil
+		} else if !errors.Is(err, cache.ErrNotFound) {
+			m.Log.Warn("tile store read failed", "key", key, "error", err)
+		}
 	}
 
 	result, err := m.sched.Submit(ctx, key, prio, func() (any, error) {
@@ -352,7 +370,7 @@ func (m *Manager) generate(ctx context.Context, req Request, depth int) ([]byte,
 	m.memory.Put(key, data, int64(len(data)))
 	m.images.Put(key, img, int64(len(img.Pix)))
 
-	if !blank || m.Cfg.StoreBlankTiles {
+	if !req.Sliced && (!blank || m.Cfg.StoreBlankTiles) {
 		if err := m.Store.Put(ctx, req.storeKey(m.Cfg.Format), data); err != nil {
 			// A storage failure must not fail the request: the tile is rendered
 			// and can still be served, it just will not be cached on disk.
@@ -392,6 +410,7 @@ func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.Dimen
 	var iso *render.Iso
 	if req.Mode == ModeIso {
 		iso = render.NewIso(sh, req.Camera, m.Cfg.IsoEdgeSkirt)
+		iso.Sliced, iso.SliceY = req.Sliced, req.SliceY
 		bounds = iso.SurfaceBounds(req.Pos, dim.MinY, dim.MaxY)
 	} else {
 		td := render.NewTopDown(sh)
@@ -522,15 +541,21 @@ func (m *Manager) childImage(ctx context.Context, req Request, depth int) (*imag
 	if img, ok := m.images.Get(key); ok {
 		return img, nil
 	}
-	if data, err := m.Store.Get(ctx, req.storeKey(m.Cfg.Format)); err == nil {
-		img, derr := decodeTile(data)
-		if derr == nil {
-			m.images.Put(key, img, int64(len(img.Pix)))
-			return img, nil
+	// The store is keyed without the slice level, so for a sliced request it
+	// must be bypassed in both directions: reading would return the whole-world
+	// tile and silently undo the slice, and writing would file a cut-away image
+	// under the unsliced key and corrupt the stored pyramid for everyone.
+	if !req.Sliced {
+		if data, err := m.Store.Get(ctx, req.storeKey(m.Cfg.Format)); err == nil {
+			img, derr := decodeTile(data)
+			if derr == nil {
+				m.images.Put(key, img, int64(len(img.Pix)))
+				return img, nil
+			}
+			m.Log.Warn("stored tile failed to decode, regenerating", "key", key, "error", derr)
+		} else if !errors.Is(err, cache.ErrNotFound) {
+			return nil, err
 		}
-		m.Log.Warn("stored tile failed to decode, regenerating", "key", key, "error", derr)
-	} else if !errors.Is(err, cache.ErrNotFound) {
-		return nil, err
 	}
 
 	if depth+1 > m.Cfg.MaxCompositeDepth {
@@ -542,12 +567,16 @@ func (m *Manager) childImage(ctx context.Context, req Request, depth int) (*imag
 		return nil, err
 	}
 	// Persist the freshly rendered child so sibling parents and later requests
-	// do not repeat the work.
+	// do not repeat the work. Sliced children are memory-only, for the same
+	// reason sliced tiles are: one variant per level would multiply the stored
+	// pyramid, and the store key cannot tell them apart anyway.
 	u := m.opts.UnexploredColor
 	if !render.IsBlank(img, u.R, u.G, u.B, u.A) || m.Cfg.StoreBlankTiles {
 		if data, encErr := m.enc.Encode(img); encErr == nil {
-			if perr := m.Store.Put(ctx, req.storeKey(m.Cfg.Format), data); perr != nil {
-				m.Log.Error("child tile store write failed", "key", key, "error", perr)
+			if !req.Sliced {
+				if perr := m.Store.Put(ctx, req.storeKey(m.Cfg.Format), data); perr != nil {
+					m.Log.Error("child tile store write failed", "key", key, "error", perr)
+				}
 			}
 			m.memory.Put(key, data, int64(len(data)))
 		}

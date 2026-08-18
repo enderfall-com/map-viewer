@@ -751,6 +751,19 @@ async function boot(): Promise<void> {
   const scaleBarLine = el('span', 'mm-scalebar-line');
   const scaleBarLabel = el('span', 'mm-scalebar-label mm-mono');
   scaleBar.append(scaleBarLine, scaleBarLabel);
+  // Y slice: cuts the isometric world open above a level so caves, mineshafts
+  // and building interiors are visible. Vertical to match the axis it controls,
+  // and hidden in plan view, which has no depth to cut into.
+  const sliceWrap = el('div', 'mm-slice mm-panel');
+  const sliceLabel = el('div', 'mm-slice-label mm-mono');
+  const sliceInput = el('input', 'mm-slice-input');
+  sliceInput.type = 'range';
+  sliceInput.min = String(dimension.minY);
+  sliceInput.max = String(dimension.maxY);
+  sliceInput.value = String(dimension.maxY);
+  sliceInput.title = 'Cut the view off above this Y level';
+  sliceWrap.append(sliceLabel, sliceInput);
+
   const rotateBtn = el('button', 'mm-zoom-btn');
   const zoomIn = el('button', 'mm-zoom-btn');
   const zoomOut = el('button', 'mm-zoom-btn');
@@ -763,7 +776,7 @@ async function boot(): Promise<void> {
   zoomIn.title = 'Zoom in';
   zoomOut.title = 'Zoom out';
   homeBtn.title = 'Go to spawn';
-  rightCol.append(compass, scaleBar, rotateBtn, zoomIn, zoomOut, homeBtn);
+  rightCol.append(compass, scaleBar, sliceWrap, rotateBtn, zoomIn, zoomOut, homeBtn);
   chrome.appendChild(rightCol);
 
   function updateScaleBar(): void {
@@ -782,11 +795,38 @@ async function boot(): Promise<void> {
     const bearing = iso ? northBearingDeg(engine.camera) : 0;
     compassDial.style.transform = `rotate(${bearing.toFixed(1)}deg)`;
     rotateBtn.hidden = !iso;
+    sliceWrap.hidden = !iso;
     if (iso) {
       rotateBtn.title = `Rotate view (${engine.camera.toUpperCase()} → ${nextCamera(engine.camera).toUpperCase()})`;
     }
   }
   updateCompass();
+
+  /** The slider sits at the dimension ceiling when nothing is being cut, so
+   * "no slice" and "slice at the very top" are the same position. */
+  function updateSliceLabel(): void {
+    const y = engine.getSliceY();
+    sliceLabel.textContent = y === null ? 'Y ALL' : `Y ${y}`;
+  }
+  updateSliceLabel();
+
+  sliceInput.addEventListener('input', () => {
+    const y = Number(sliceInput.value);
+    // At or above the ceiling nothing is cut away, so drop the slice entirely
+    // and let the view go back to the ordinary stored tiles.
+    engine.setSliceY(y >= engine.getDimension().maxY ? null : y);
+    updateSliceLabel();
+  });
+
+  // Re-range the slider when the dimension changes: the Nether's ceiling and a
+  // mining dimension's floor are nothing like the overworld's.
+  engine.on('dimension', (d) => {
+    sliceInput.min = String(d.minY);
+    sliceInput.max = String(d.maxY);
+    sliceInput.value = String(d.maxY);
+    engine.setSliceY(null);
+    updateSliceLabel();
+  });
 
   rotateBtn.addEventListener('click', () => {
     void rotateView(nextCamera(engine.camera)).then(flashLoading);

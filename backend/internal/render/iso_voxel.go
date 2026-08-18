@@ -70,7 +70,8 @@ func (r *Iso) drawVoxelColumn(
 	col world.Column,
 ) {
 	vol := r.Volume
-	top, ok := vol.TopY(x, z)
+	rawTop, ok := vol.TopY(x, z)
+	top, _ := r.sliceTopY(vol, x, z)
 	depth := vol.Depth(x, z)
 	if !ok || depth <= 0 {
 		// The column's chunk was not loaded into the volume window at all.
@@ -80,7 +81,15 @@ func (r *Iso) drawVoxelColumn(
 		r.drawColumn(img, surf, ib, ppu, w, h, a, b, x, z, col)
 		return
 	}
-	floor := top - depth + 1
+	// Depth is measured from the column's real top, so the floor must be too:
+	// the slice only hides what is above it and never moves the stored slab.
+	floor := rawTop - depth + 1
+	if top < floor {
+		// The slice is below everything this column has stored, so there is
+		// nothing left of it to draw -- not even the basement skirt, which
+		// would otherwise hang in the air under a fully cut-away column.
+		return
+	}
 	reg := r.Shader.Blocks
 
 	// A decoration (grass, flower, sapling, crop) is never its own voxel --
@@ -91,13 +100,13 @@ func (r *Iso) drawVoxelColumn(
 	drawTop := top
 	var decorID uint16
 	var decorLight uint8
-	if id, light, ok := vol.BlockAt(x, top, z); ok && id != 0 && reg.Get(id).Decoration {
+	if id, light, ok := r.sliceBlockAt(vol, x, top, z); ok && id != 0 && reg.Get(id).Decoration {
 		decorID, decorLight = id, light
 		drawTop = top - 1
 	}
 
 	for y := floor; y <= drawTop; y++ {
-		id, light, ok := vol.BlockAt(x, y, z)
+		id, light, ok := r.sliceBlockAt(vol, x, y, z)
 		if !ok || id == 0 {
 			continue // air, or a gap the descent never wrote
 		}
@@ -141,6 +150,33 @@ func (r *Iso) voxelFaceVisibility(vol *world.Volume, a, b, x, y, z int) (top, le
 	return
 }
 
+// sliceBlockAt is Volume.BlockAt with the Y slice applied: anything above
+// SliceY reads as air rather than as whatever is really there.
+//
+// It reports ok=true for those positions, not ok=false. The two answers mean
+// different things to the occlusion predicate -- ok=false is "unknown, so
+// assume it does not occlude", while air is "known empty" -- and above the cut
+// the block genuinely is not there. Routing both drawing and occlusion through
+// here is what makes the cut face visible: without it the terrain still
+// standing above the slice would go on hiding the top face of the voxel the
+// slice exposes, and the cut would render as a hole.
+func (r *Iso) sliceBlockAt(vol *world.Volume, x, y, z int) (uint16, uint8, bool) {
+	if r.Sliced && y > r.SliceY {
+		return 0, 0, true
+	}
+	return vol.BlockAt(x, y, z)
+}
+
+// sliceTopY is Volume.TopY clamped to the slice, so a column that continues
+// above the cut is drawn as though it ended there.
+func (r *Iso) sliceTopY(vol *world.Volume, x, z int) (int, bool) {
+	top, ok := vol.TopY(x, z)
+	if ok && r.Sliced && top > r.SliceY {
+		top = r.SliceY
+	}
+	return top, ok
+}
+
 // voxelOccludes reports whether the block at a world position fully hides
 // what is behind it. ok=false from Volume.BlockAt -- outside the stored slab
 // or ungenerated -- must never be treated as occluding: guessing "occluded"
@@ -155,7 +191,7 @@ func (r *Iso) voxelFaceVisibility(vol *world.Volume, a, b, x, y, z int) (top, le
 // in the process's lifetime could run before its own face-sampling step
 // resolves it, using the stale flag-derived value for that one check.
 func (r *Iso) voxelOccludes(vol *world.Volume, x, y, z int) bool {
-	id, _, ok := vol.BlockAt(x, y, z)
+	id, _, ok := r.sliceBlockAt(vol, x, y, z)
 	if !ok || id == 0 {
 		return false
 	}

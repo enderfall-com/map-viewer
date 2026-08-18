@@ -904,6 +904,36 @@ button {
   height: 38px;
 }
 
+/* Y slice control. Vertical because it controls a vertical axis: dragging down
+   cuts further down into the world, which is the mapping the user expects. */
+.mm-slice {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 38px;
+  padding: 8px 0;
+}
+
+.mm-slice-label {
+  font-size: 9px;
+  color: var(--blue);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.mm-slice-input {
+  /* Upright, with the maximum at the top so the handle's height mirrors the
+     height of the cut. */
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 18px;
+  height: 120px;
+  margin: 0;
+  accent-color: var(--blue);
+  cursor: ns-resize;
+}
+
 /* Rotated as one piece so the "N" stays attached to the arrowhead. In
    isometric mode north is not up -- the bearing comes from the projection for
    the active camera, so the dial cannot disagree with the terrain. */

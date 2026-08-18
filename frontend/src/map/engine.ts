@@ -75,6 +75,7 @@ export interface EngineEventMap {
   click: ClickInfo;
   mode: MapMode;
   camera: IsoCamera;
+  slice: number | null;
   style: string;
   dimension: DimensionInfo;
 }
@@ -94,6 +95,10 @@ export class MapEngine {
    * {@link setCamera}; overlays read it every frame, so they follow a rotation
    * without needing to be told about it. */
   camera: IsoCamera;
+
+  /** The Y level the isometric view is cut off above, or null for the whole
+   * world. See {@link setSliceY}. */
+  private sliceY: number | null = null;
 
   private readonly api: ApiClient;
   private readonly layers: Record<MapMode, TileLayer>;
@@ -283,6 +288,7 @@ export class MapEngine {
     // saying -- so the default view's URLs stay byte-identical to before
     // rotation existed, and keep hitting tiles already cached under them.
     if (mode === 'iso' && this.camera !== DEFAULT_CAMERA) params.set('cam', this.camera);
+    if (mode === 'iso' && this.sliceY !== null) params.set('sliceY', String(this.sliceY));
     const path = this.config.tileUrlTemplate
       .replace('{dimension}', encodeURIComponent(this.dimension.id))
       .replace('{mode}', mode)
@@ -446,10 +452,12 @@ export class MapEngine {
   async pickAt(coord: Coordinate, key: string | null = 'pick') {
     if (this.mode === 'iso') {
       const [u, v] = mapToIso(coord[0], coord[1]);
-      // The camera has to travel with the pick: the same (u, v) names a
-      // different world column from each corner, so a ray march against the
-      // wrong one would resolve a click to the wrong block entirely.
-      return this.api.pickIso(this.dimension.id, u, v, key, this.camera);
+      // The camera and the slice both have to travel with the pick: the same
+      // (u, v) names a different world column from each corner, and under a
+      // slice the visible surface is the cut face rather than the real
+      // terrain, so a ray march without them resolves the click to a block
+      // the user cannot even see.
+      return this.api.pickIso(this.dimension.id, u, v, key, this.camera, this.sliceY);
     }
     const [x, z] = mapToBlock(coord[0], coord[1]);
     return this.api.pickTop(this.dimension.id, Math.floor(x), Math.floor(z), key);
@@ -684,6 +692,7 @@ export class MapEngine {
     // Every isometric tile URL now names a different camera, so the ones
     // already loaded are for the previous corner and must be dropped.
     this.sources.iso.refresh();
+    this.map.render();
 
     const newCenter = this.blockToView(x, z, y);
     this.view.setCenter(newCenter);
@@ -691,6 +700,30 @@ export class MapEngine {
     this.lastResolvedY = y;
     this.emit('camera', camera);
     this.emit('moveend');
+  }
+
+  /** The Y level the isometric view is currently cut at, or null for none. */
+  getSliceY(): number | null {
+    return this.sliceY;
+  }
+
+  /**
+   * Cuts the isometric view off above a Y level, or removes the cut with null.
+   *
+   * Unlike a rotation this does not disturb the view: the projection and the
+   * map-coordinate space are unchanged, only which blocks are drawn, so the
+   * tiles are simply re-requested in place. Sliced tiles are rendered on
+   * demand and cached only in memory server-side, which is why dragging the
+   * control is a live re-render rather than a lookup.
+   */
+  setSliceY(y: number | null): void {
+    if (y === this.sliceY) return;
+    this.sliceY = y;
+    // refresh() only marks the source dirty; the render is what actually
+    // re-requests the tiles under their new URLs.
+    this.sources.iso.refresh();
+    this.map.render();
+    this.emit('slice', y);
   }
 
   /** Changes the render style, which is a different tile variant. */

@@ -275,6 +275,7 @@ export class ApiClient {
     v: number,
     key: string | null = 'pick',
     cam?: string,
+    sliceY?: number | null,
   ): Promise<PickResult | null> {
     return this.validatedPick(
       await this.get<PickResult>(key, '/api/pick', {
@@ -283,6 +284,7 @@ export class ApiClient {
         u: u.toFixed(3),
         v: v.toFixed(3),
         cam,
+        sliceY: sliceY ?? undefined,
       }),
     );
   }

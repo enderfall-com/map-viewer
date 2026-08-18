@@ -311,6 +311,28 @@ func (s *Server) isoCameraParam(r *http.Request) (mcmath.IsoCamera, bool) {
 	return mcmath.ParseIsoCamera(v)
 }
 
+// sliceParam resolves the ?sliceY= query parameter: the highest Y an
+// isometric view draws, cutting away everything above it.
+//
+// Absent, or at/above the dimension's ceiling, means no slice at all -- so a
+// client parked at the top of its slider costs nothing and keeps using the
+// ordinary stored tiles. Values below the floor are clamped rather than
+// rejected, since an empty image is a confusing answer to a slider drag.
+func (s *Server) sliceParam(r *http.Request, dim world.DimensionInfo) (bool, int) {
+	v := r.URL.Query().Get("sliceY")
+	if v == "" {
+		return false, 0
+	}
+	y, err := strconv.Atoi(v)
+	if err != nil || y >= dim.MaxY {
+		return false, 0
+	}
+	if y < dim.MinY {
+		y = dim.MinY
+	}
+	return true, y
+}
+
 func intParam(r *http.Request, name string, def int) int {
 	v := r.URL.Query().Get(name)
 	if v == "" {
@@ -728,8 +750,16 @@ func (s *Server) handlePick(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// A click has to be resolved against the same cut-away world the tile
+		// under the cursor was rendered from, so the slice travels with the
+		// pick exactly as the camera does.
+		ceilY := dim.MaxY
+		if sliced, sliceY := s.sliceParam(r, dim); sliced {
+			ceilY = sliceY
+		}
+
 		if s.Cfg.Render.IsoVoxel && s.Provider.SupportsVoxels() {
-			if hx, hy, hz, id, light, vok := s.voxelPick(ctx, dim, proj, probe, surf, u, v); vok {
+			if hx, hy, hz, id, light, vok := s.voxelPick(ctx, dim, proj, probe, surf, u, v, ceilY); vok {
 				col := surf.At(hx, hz)
 				res := PickResult{
 					Dimension: dim.ID, X: hx, Y: hy, Z: hz,
@@ -800,7 +830,7 @@ func (s *Server) handlePick(w http.ResponseWriter, r *http.Request) {
 // march -- world-read failure, or the ray finding no occluding voxel within
 // the tightened voxel window -- never "confirmed nothing is there", which is
 // what a plain "not found" answer must mean instead.
-func (s *Server) voxelPick(ctx context.Context, dim world.DimensionInfo, proj mcmath.IsoProjection, probe mcmath.IsoBounds, surf *world.Surface, u, v float64) (x, y, z int, blockID uint16, light uint8, ok bool) {
+func (s *Server) voxelPick(ctx context.Context, dim world.DimensionInfo, proj mcmath.IsoProjection, probe mcmath.IsoBounds, surf *world.Surface, u, v float64, ceilY int) (x, y, z int, blockID uint16, light uint8, ok bool) {
 	lo, hi, hok := surf.HeightRange()
 	if !hok {
 		return 0, 0, 0, 0, 0, false
@@ -814,7 +844,10 @@ func (s *Server) voxelPick(ctx context.Context, dim world.DimensionInfo, proj mc
 		s.Log.Warn("voxel pick assembly failed, falling back to heightmap pick", "dimension", dim.ID, "error", err)
 		return 0, 0, 0, 0, 0, false
 	}
-	hx, hy, hz, hit := world.VoxelRayMarch(proj, u, v, dim.MinY, dim.MaxY, vol, func(id uint16) bool {
+	// The ray starts at ceilY rather than the dimension ceiling, so under a Y
+	// slice a click resolves to the cut surface the user can actually see
+	// instead of to the terrain the slice removed from the image.
+	hx, hy, hz, hit := world.VoxelRayMarch(proj, u, v, dim.MinY, ceilY, vol, func(id uint16) bool {
 		return s.Blocks.Get(id).Occludes
 	})
 	if !hit {
@@ -911,12 +944,16 @@ func (s *Server) serveTile(w http.ResponseWriter, r *http.Request, dimRaw, modeR
 		return
 	}
 
+	sliced, sliceY := s.sliceParam(r, dim)
+
 	req := tiles.Request{
 		Dimension: dim.ID,
 		Mode:      mode,
 		Style:     style,
 		Pos:       mcmath.TilePos{Zoom: z, X: x, Y: y},
 		Camera:    cam,
+		Sliced:    sliced,
+		SliceY:    sliceY,
 	}
 
 	data, err := s.Tiles.Tile(r.Context(), req, tiles.PriorityUser)
