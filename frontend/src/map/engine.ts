@@ -34,6 +34,15 @@ import type { ClientConfig, DimensionInfo, TileRevision } from '../api/types';
 
 export type MapMode = 'top' | 'iso';
 
+/** The camera corner and Y-slice one isometric tile source's requests carry.
+ * Each of the engine's two iso slots owns one of these, mutated in place by
+ * beginIsoTransition so its tileUrlFunction closure picks up the change on
+ * the very next request without needing to be rebuilt. */
+interface IsoTileParams {
+  camera: IsoCamera;
+  sliceY: number | null;
+}
+
 /** The reference elevation overlays are drawn on when terrain height is unknown. */
 const DEFAULT_REFERENCE_Y = 64;
 
@@ -78,6 +87,11 @@ export interface EngineEventMap {
   slice: number | null;
   style: string;
   dimension: DimensionInfo;
+  /** Whether the isometric source has tile requests in flight. A cold tile
+   * (PERF_PLAN.md §1) can take seconds, so this reflects real completion
+   * rather than a fixed-duration flash -- long enough that a flash would
+   * either cut off early or linger after the tiles are already in. */
+  isoLoading: boolean;
 }
 
 /**
@@ -101,11 +115,34 @@ export class MapEngine {
   private sliceY: number | null = null;
 
   private readonly api: ApiClient;
-  private readonly layers: Record<MapMode, TileLayer>;
-  private readonly sources: Record<MapMode, XYZ>;
+  private readonly layers: { top: TileLayer };
+  private readonly sources: { top: XYZ };
+  private readonly contourLayers: { top: TileLayer; iso: [TileLayer, TileLayer] };
+  private readonly contourSources: { top: XYZ; iso: [XYZ, XYZ] };
+  /**
+   * Two independent iso layers/sources so a camera or slice change never
+   * blanks the map: the new params load into whichever slot is currently
+   * hidden while the other keeps showing its already-rendered tiles, and
+   * only once the new one is ready does it become the visible one. A single
+   * shared source can't do this -- `source.refresh()` bumps its cache
+   * revision, which OpenLayers treats as "discard every tile" (see
+   * evictRevisedTiles's doc comment for the same quirk), so reusing one
+   * source for a param change means the view goes blank the instant the
+   * change is requested, not once the replacement is ready.
+   */
+  private readonly isoLayers: [TileLayer, TileLayer];
+  private readonly isoSources: [XYZ, XYZ];
+  private readonly isoParams: [IsoTileParams, IsoTileParams];
+  /** Index into isoLayers/isoSources/isoParams of the slot currently on top
+   * when no transition is in progress. */
+  private isoFront: 0 | 1 = 0;
+  /** The slot a crossfade is currently loading into, or null when idle. */
+  private pendingIsoSwap: 0 | 1 | null = null;
+  private isoSwapTimer: number | null = null;
 
   private mode: MapMode = 'top';
   private style: string;
+  private contours = false;
   private dimension: DimensionInfo;
 
   /**
@@ -129,6 +166,11 @@ export class MapEngine {
    * rather than a fixed plane. Cleared when the dimension changes, since a
    * height from another world says nothing about this one. */
   private lastResolvedY: number | null = null;
+
+  /** Isometric tile requests currently in flight, per slot, so
+   * {@link EngineEventMap}'s `isoLoading` reflects real completion and a
+   * crossfade knows when its back slot is ready to become the front one. */
+  private isoPending: [number, number] = [0, 0];
 
   constructor(target: HTMLElement, config: ClientConfig, api: ApiClient, dimension: DimensionInfo) {
     this.config = config;
@@ -175,18 +217,54 @@ export class MapEngine {
       showFullExtent: true,
     });
 
-    this.sources = {
-      top: this.createSource('top', config.topMaxDataZoom),
-      iso: this.createSource('iso', config.isoMaxDataZoom),
+    this.sources = { top: this.createTopSource(config.topMaxDataZoom) };
+    this.layers = { top: new TileLayer({ source: this.sources.top, visible: true, zIndex: 0 }) };
+
+    this.isoParams = [
+      { camera: this.camera, sliceY: null },
+      { camera: this.camera, sliceY: null },
+    ];
+    this.isoSources = [
+      this.createIsoSource(config.isoMaxDataZoom, this.isoParams[0]),
+      this.createIsoSource(config.isoMaxDataZoom, this.isoParams[1]),
+    ];
+    this.isoLayers = [
+      new TileLayer({ source: this.isoSources[0], visible: false, zIndex: 1 }),
+      new TileLayer({ source: this.isoSources[1], visible: false, zIndex: 2 }),
+    ];
+    this.contourSources = {
+      top: this.createTopSource(config.topMaxDataZoom, 'contour'),
+      iso: [
+        this.createIsoSource(config.isoMaxDataZoom, this.isoParams[0], 'contour'),
+        this.createIsoSource(config.isoMaxDataZoom, this.isoParams[1], 'contour'),
+      ],
     };
-    this.layers = {
-      top: new TileLayer({ source: this.sources.top, visible: true, zIndex: 0 }),
-      iso: new TileLayer({ source: this.sources.iso, visible: false, zIndex: 0 }),
+    this.contourLayers = {
+      top: new TileLayer({ source: this.contourSources.top, visible: false, zIndex: 5 }),
+      iso: [
+        new TileLayer({ source: this.contourSources.iso[0], visible: false, zIndex: 6 }),
+        new TileLayer({ source: this.contourSources.iso[1], visible: false, zIndex: 7 }),
+      ],
     };
+    for (const slot of [0, 1] as const) {
+      this.isoSources[slot].on('tileloadstart', () => this.trackIsoTileLoad(slot, 1));
+      this.isoSources[slot].on('tileloadend', () => this.trackIsoTileLoad(slot, -1));
+      this.isoSources[slot].on('tileloaderror', () => this.trackIsoTileLoad(slot, -1));
+      this.contourSources.iso[slot].on('tileloadstart', () => this.trackIsoTileLoad(slot, 1));
+      this.contourSources.iso[slot].on('tileloadend', () => this.trackIsoTileLoad(slot, -1));
+      this.contourSources.iso[slot].on('tileloaderror', () => this.trackIsoTileLoad(slot, -1));
+    }
 
     this.map = new OlMap({
       target,
-      layers: [this.layers.top, this.layers.iso],
+      layers: [
+        this.layers.top,
+        this.isoLayers[0],
+        this.isoLayers[1],
+        this.contourLayers.top,
+        this.contourLayers.iso[0],
+        this.contourLayers.iso[1],
+      ],
       view: this.view,
       // OpenLayers' stock zoom buttons, attribution and rotate control are
       // replaced by the app's own chrome.
@@ -202,6 +280,18 @@ export class MapEngine {
       // makes fast panning feel seamless: the tile is usually already there.
       moveTolerance: 1,
     });
+
+    // A container whose size isn't settled yet at construction time (a CSS
+    // layout pass not yet resolved on first paint) leaves OpenLayers sizing
+    // its initial render to whatever the target measured at that instant --
+    // if that was wrong, only the tiles that happened to fall inside the
+    // stale viewport ever get painted, showing as small disconnected
+    // fragments surrounded by nothing rather than a full map, even though
+    // every tile fetch itself succeeds. A plain `resize` event listener only
+    // fires for later window resizes and would miss exactly this case;
+    // ResizeObserver also fires once for the element's size at the moment
+    // observation starts, so it catches the initial layout settling too.
+    new ResizeObserver(() => this.map.updateSize()).observe(target);
 
     this.view.on('change:resolution', () => {
       this.enforceIsoMinZoom();
@@ -232,15 +322,30 @@ export class MapEngine {
     return out;
   }
 
+  /** Creates the top-down tile source. See {@link buildSource} for what the
+   * tile grid and loading options mean. */
+  private createTopSource(maxDataZoom: number, style?: string): XYZ {
+    return this.buildSource(maxDataZoom, (z, x, y) => this.tileUrl('top', z, x, y, undefined, style));
+  }
+
+  /** Creates one isometric tile source bound to a specific slot's camera/
+   * slice params object, read fresh on every tile request -- not `this.camera`
+   * /`this.sliceY` -- so the two iso slots can each keep asking for tiles
+   * under their own params independently of whichever one the engine's
+   * public getters currently report (see the isoLayers field doc comment). */
+  private createIsoSource(maxDataZoom: number, params: IsoTileParams, style?: string): XYZ {
+    return this.buildSource(maxDataZoom, (z, x, y) => this.tileUrl('iso', z, x, y, params, style));
+  }
+
   /**
-   * Creates a tile source for one mode.
+   * Creates a tile source.
    *
    * The tile grid stops at `maxDataZoom` -- the deepest level for which the
    * server renders tiles. Beyond that OpenLayers reuses the deepest tiles and
    * scales them up, which costs no storage and, with interpolation disabled, is
    * exactly the crisp block magnification Minecraft terrain should have.
    */
-  private createSource(mode: MapMode, maxDataZoom: number): XYZ {
+  private buildSource(maxDataZoom: number, urlFor: (z: number, x: number, y: number) => string): XYZ {
     const limit = 30_000_000;
     const tileGrid = new TileGrid({
       extent: [-limit, -limit, limit, limit],
@@ -265,7 +370,7 @@ export class MapEngine {
       tileUrlFunction: (tileCoord) => {
         if (!tileCoord) return undefined;
         const [z, x, y] = tileCoord;
-        return this.tileUrl(mode, z, x, y);
+        return urlFor(z, x, y);
       },
     });
   }
@@ -279,16 +384,22 @@ export class MapEngine {
    * a different path structure or file extension -- without a frontend
    * rebuild. Hard-coding the path here and only reading the template for its
    * file extension would silently drift from it instead.
+   *
+   * `iso` is the specific slot's own camera/slice params, not necessarily
+   * `this.camera`/`this.sliceY` -- see createIsoSource's doc comment for why
+   * that distinction is what makes the crossfade work. Omitted for top-down,
+   * which has no viewing corner or slice.
    */
-  private tileUrl(mode: MapMode, z: number, x: number, y: number): string {
+  private tileUrl(mode: MapMode, z: number, x: number, y: number, iso?: IsoTileParams, styleOverride?: string): string {
     const rev = this.revisions.get(`${mode}/${z}/${x}/${y}`) ?? this.baseRevision;
     const params = new URLSearchParams();
-    if (this.style && this.style !== 'terrain') params.set('style', this.style);
-    // Only isometric has a viewing corner, and only a non-default one needs
-    // saying -- so the default view's URLs stay byte-identical to before
-    // rotation existed, and keep hitting tiles already cached under them.
-    if (mode === 'iso' && this.camera !== DEFAULT_CAMERA) params.set('cam', this.camera);
-    if (mode === 'iso' && this.sliceY !== null) params.set('sliceY', String(this.sliceY));
+    const style = styleOverride ?? this.style;
+    if (style && (styleOverride || style !== 'terrain')) params.set('style', style);
+    // Only a non-default camera needs saying -- so the default view's URLs
+    // stay byte-identical to before rotation existed, and keep hitting tiles
+    // already cached under them.
+    if (iso && iso.camera !== DEFAULT_CAMERA) params.set('cam', iso.camera);
+    if (iso && iso.sliceY !== null) params.set('sliceY', String(iso.sliceY));
     const path = this.config.tileUrlTemplate
       .replace('{dimension}', encodeURIComponent(this.dimension.id))
       .replace('{mode}', mode)
@@ -634,7 +745,20 @@ export class MapEngine {
     this.mode = mode;
     this.resolvedCenter = null;
     this.layers.top.setVisible(mode === 'top');
-    this.layers.iso.setVisible(mode === 'iso');
+    this.contourLayers.top.setVisible(this.contours && mode === 'top');
+    // Coming from top-down there is no prior iso content worth crossfading
+    // from, so this shows the front slot directly rather than going through
+    // beginIsoTransition; leaving iso mode hides both slots, cancelling
+    // whatever transition (if any) was still in flight.
+    this.isoLayers[this.isoFront].setVisible(mode === 'iso');
+    this.isoLayers[1 - this.isoFront].setVisible(false);
+    this.contourLayers.iso[this.isoFront].setVisible(this.contours && mode === 'iso');
+    this.contourLayers.iso[1 - this.isoFront].setVisible(false);
+    this.pendingIsoSwap = null;
+    if (this.isoSwapTimer !== null) {
+      window.clearTimeout(this.isoSwapTimer);
+      this.isoSwapTimer = null;
+    }
     this.enforceIsoMinZoom();
 
     const newCenter = this.blockToView(x, z, y);
@@ -690,9 +814,10 @@ export class MapEngine {
     this.camera = camera;
     this.resolvedCenter = null;
     // Every isometric tile URL now names a different camera, so the ones
-    // already loaded are for the previous corner and must be dropped.
-    this.sources.iso.refresh();
-    this.map.render();
+    // already loaded are for the previous corner and must be replaced --
+    // via a crossfade, not a same-source refresh, so the old corner stays on
+    // screen until the new one is actually ready (see the isoLayers field).
+    this.beginIsoTransition({ camera, sliceY: this.sliceY });
 
     const newCenter = this.blockToView(x, z, y);
     this.view.setCenter(newCenter);
@@ -712,18 +837,91 @@ export class MapEngine {
    *
    * Unlike a rotation this does not disturb the view: the projection and the
    * map-coordinate space are unchanged, only which blocks are drawn, so the
-   * tiles are simply re-requested in place. Sliced tiles are rendered on
-   * demand and cached only in memory server-side, which is why dragging the
-   * control is a live re-render rather than a lookup.
+   * tiles are simply re-requested in place -- via a crossfade, so the
+   * previous slice stays visible until the new one is ready rather than the
+   * map blanking out for however long the (potentially cold, server-side
+   * rendered) new level takes. Sliced tiles are rendered on demand and
+   * cached only in memory server-side, which is why dragging the control is
+   * a live re-render rather than a lookup.
    */
   setSliceY(y: number | null): void {
     if (y === this.sliceY) return;
     this.sliceY = y;
-    // refresh() only marks the source dirty; the render is what actually
-    // re-requests the tiles under their new URLs.
-    this.sources.iso.refresh();
-    this.map.render();
+    this.beginIsoTransition({ camera: this.camera, sliceY: y });
     this.emit('slice', y);
+  }
+
+  /**
+   * Starts loading new camera/slice params into whichever iso slot is
+   * currently hidden, on top of (but not yet replacing) the one still
+   * showing the old params. See the isoLayers field doc comment for why this
+   * exists; see completeIsoSwap for how it finishes.
+   */
+  private beginIsoTransition(params: IsoTileParams): void {
+    const back = (1 - this.isoFront) as 0 | 1;
+    this.isoParams[back].camera = params.camera;
+    this.isoParams[back].sliceY = params.sliceY;
+    // The back slot's own cache may hold tiles from whatever params it
+    // carried the *previous* time it was a back slot; those are for neither
+    // the old nor the new view and must go. This never touches the front
+    // slot, so nothing currently on screen is affected.
+    this.isoSources[back].refresh();
+    this.contourSources.iso[back].refresh();
+    this.isoLayers[back].setZIndex(2);
+    this.isoLayers[this.isoFront].setZIndex(1);
+    this.contourLayers.iso[back].setZIndex(7);
+    this.contourLayers.iso[this.isoFront].setZIndex(6);
+    this.isoLayers[back].setVisible(true);
+    this.contourLayers.iso[back].setVisible(this.contours && this.mode === 'iso');
+    this.pendingIsoSwap = back;
+    if (this.isoSwapTimer !== null) window.clearTimeout(this.isoSwapTimer);
+    // Fallback in case tiles never finish loading (offline, a request that
+    // never resolves): complete the swap anyway after a bounded wait rather
+    // than leaving the old view stuck on top forever. Chosen well above a
+    // typical cold isoVoxel render (PERF_PLAN.md §1: usually well under 2s).
+    this.isoSwapTimer = window.setTimeout(() => this.completeIsoSwap(back), 6000);
+    this.map.render();
+    // If every tile the back slot needs was already cached, tileloadstart/end
+    // never fire at all (no network request happens), so trackIsoTileLoad
+    // would never see the 0 that normally triggers completion. Checking once
+    // more on the next frame, after OpenLayers has had a chance to actually
+    // request anything, catches that all-cached case too.
+    requestAnimationFrame(() => {
+      if (this.pendingIsoSwap === back && this.isoPending[back] === 0) {
+        this.completeIsoSwap(back);
+      }
+    });
+  }
+
+  /** Promotes slot to the front (visible, authoritative) and hides the other
+   * one, completing a crossfade started by beginIsoTransition. A no-op if
+   * a newer transition has already superseded this one. */
+  private completeIsoSwap(slot: 0 | 1): void {
+    if (this.pendingIsoSwap !== slot) return;
+    this.pendingIsoSwap = null;
+    if (this.isoSwapTimer !== null) {
+      window.clearTimeout(this.isoSwapTimer);
+      this.isoSwapTimer = null;
+    }
+    this.isoFront = slot;
+    this.isoLayers[(1 - slot) as 0 | 1].setVisible(false);
+    this.contourLayers.iso[(1 - slot) as 0 | 1].setVisible(false);
+    this.map.render();
+  }
+
+  /** Updates the in-flight iso tile count for one slot and emits
+   * `isoLoading` on 0<->>0 transitions only, so listeners get a clean
+   * start/stop signal instead of a spammy count on every single tile. Also
+   * completes a pending crossfade once its slot's tiles have all arrived. */
+  private trackIsoTileLoad(slot: 0 | 1, delta: number): void {
+    const wasAny = this.isoPending[0] > 0 || this.isoPending[1] > 0;
+    this.isoPending[slot] = Math.max(0, this.isoPending[slot] + delta);
+    const isAny = this.isoPending[0] > 0 || this.isoPending[1] > 0;
+    if (wasAny !== isAny) this.emit('isoLoading', isAny);
+
+    if (this.pendingIsoSwap === slot && this.isoPending[slot] === 0) {
+      this.completeIsoSwap(slot);
+    }
   }
 
   /** Changes the render style, which is a different tile variant. */
@@ -732,6 +930,16 @@ export class MapEngine {
     this.style = style;
     this.refreshTiles();
     this.emit('style', style);
+  }
+
+  /** Shows or hides the independent contour raster overlay. */
+  setContours(enabled: boolean): void {
+    this.contours = enabled;
+    this.contourLayers.top.setVisible(enabled && this.mode === 'top');
+    this.contourLayers.iso[this.isoFront].setVisible(enabled && this.mode === 'iso');
+    const back = (1 - this.isoFront) as 0 | 1;
+    this.contourLayers.iso[back].setVisible(enabled && this.mode === 'iso' && this.pendingIsoSwap === back);
+    this.map.render();
   }
 
   /**
@@ -818,21 +1026,47 @@ export class MapEngine {
   private evictRevisedTiles(): void {
     for (const key of this.pendingRevisionKeys) {
       const [mode, zStr, xStr, yStr] = key.split('/');
-      const layer = this.layers[mode as MapMode];
-      const cache = layer?.getRenderer()?.getTileCache();
-      if (!cache) continue;
-      const source = this.sources[mode as MapMode];
-      const cacheKey = getCacheKey(source, source.getKey(), Number(zStr), Number(xStr), Number(yStr));
-      if (cache.containsKey(cacheKey)) cache.remove(cacheKey);
+      const z = Number(zStr);
+      const x = Number(xStr);
+      const y = Number(yStr);
+      if (mode === 'top') {
+        this.evictFromLayer(this.layers.top, this.sources.top, z, x, y);
+        this.evictFromLayer(this.contourLayers.top, this.contourSources.top, z, x, y);
+      } else {
+        // Either iso slot -- front, back, or both -- could hold this tile,
+        // so both are checked; containsKey makes checking the one that
+        // doesn't have it a no-op rather than an error.
+        this.evictFromLayer(this.isoLayers[0], this.isoSources[0], z, x, y);
+        this.evictFromLayer(this.isoLayers[1], this.isoSources[1], z, x, y);
+        this.evictFromLayer(this.contourLayers.iso[0], this.contourSources.iso[0], z, x, y);
+        this.evictFromLayer(this.contourLayers.iso[1], this.contourSources.iso[1], z, x, y);
+      }
     }
     this.pendingRevisionKeys.clear();
     this.map.render();
   }
 
-  /** Drops every cached tile so current URLs are requested again, e.g. after a style change. */
+  /** Drops one tile from one layer's render cache, if present. Shared body
+   * for evictRevisedTiles's top and iso cases. */
+  private evictFromLayer(layer: TileLayer, source: XYZ, z: number, x: number, y: number): void {
+    const cache = layer.getRenderer()?.getTileCache();
+    if (!cache) return;
+    const cacheKey = getCacheKey(source, source.getKey(), z, x, y);
+    if (cache.containsKey(cacheKey)) cache.remove(cacheKey);
+  }
+
+  /** Drops every cached tile so current URLs are requested again, e.g. after
+   * a style or dimension change. Unlike a camera or slice change this is not
+   * crossfaded -- a style/dimension switch is a deliberate full content
+   * change, not a re-render of the same view, so an instant swap reads as
+   * correct rather than as the map having briefly broken. */
   refreshTiles(): void {
     this.sources.top.refresh();
-    this.sources.iso.refresh();
+    this.isoSources[0].refresh();
+    this.isoSources[1].refresh();
+    this.contourSources.top.refresh();
+    this.contourSources.iso[0].refresh();
+    this.contourSources.iso[1].refresh();
   }
 
   /** Recomputes size after a layout change, e.g. entering fullscreen. */

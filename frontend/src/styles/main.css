@@ -691,6 +691,14 @@ button {
   gap: 6px;
 }
 
+/* Separates the mutually-exclusive style picker from the overlay toggles
+   above it, so the two groups do not read as one undifferentiated list. */
+.mm-layers-title-sub {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
 .mm-layers-toggle {
   display: flex;
   align-items: center;
@@ -920,6 +928,23 @@ button {
   color: var(--blue);
   line-height: 1;
   white-space: nowrap;
+}
+
+/* Pulses while a sliced tile is actually rendering server-side, so a
+   multi-second cold render (PERF_PLAN.md §1) reads as work in progress rather
+   than as the control having done nothing. */
+.mm-slice-label.mm-loading {
+  animation: mm-slice-pulse 900ms ease-in-out infinite;
+}
+
+@keyframes mm-slice-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
 }
 
 .mm-slice-input {

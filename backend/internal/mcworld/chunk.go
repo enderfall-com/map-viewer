@@ -108,6 +108,10 @@ type palEntry struct {
 	// decoration marks a thin plant that should be remembered and painted
 	// over the solid ground beneath it rather than simply skipped like air.
 	decoration bool
+	// ore classifies mineable resources for the ore-heatmap style. Resolved
+	// once per palette entry rather than per block, so the full-column ore
+	// scan costs a field read instead of a string match per block.
+	ore world.OreKind
 }
 
 // section is one 16x16x16 slice of a chunk.
@@ -195,6 +199,28 @@ func (s *section) lightAt(x, y, z int) uint8 {
 		return 15
 	}
 	return best
+}
+
+// blockLightAt returns only the torch/lava/glowstone light at a position,
+// deliberately ignoring sky light.
+//
+// This is the light that decides whether hostile mobs can spawn: sky light
+// keeps the surface bright by day but is gone at night, so folding it in the
+// way lightAt does would paint an open field -- the single most spawnable
+// place in the world after dusk -- as safely lit. Absent light data reports
+// 0 rather than lightAt's 15: for shading, "unknown" is best rendered as
+// fully lit, but for a spawn-safety overlay the honest answer to "is this
+// lit?" with no data is "no".
+func (s *section) blockLightAt(x, y, z int) uint8 {
+	i := (y*16+z)*16 + x
+	if len(s.blockLight)*2 <= i {
+		return 0
+	}
+	b := s.blockLight[i/2]
+	if i%2 == 0 {
+		return b & 0x0F
+	}
+	return b >> 4
 }
 
 // decodedChunk is a chunk parsed into sections.
@@ -338,6 +364,9 @@ func (w *World) decodeSection(st nbt.Tag, spanning bool) (*section, error) {
 		blk := w.blocks.Get(id)
 
 		pe := palEntry{id: id, transparent: blk.Transparent, water: blk.Water, decoration: blk.Decoration}
+		if w.scanOres {
+			pe.ore = world.ClassifyOre(name)
+		}
 		// Waterlogged state is carried in the block properties, not the name.
 		if props, ok := entry.Get("Properties"); ok && props.Type == nbt.TagCompound {
 			if wl, ok := props.Get("waterlogged"); ok && wl.String_("") == "true" {
@@ -438,6 +467,45 @@ func (dc *decodedChunk) biomeFor(x, y, z int) (uint16, bool) {
 // heightmap keeps floating islands, modded structures and worlds with stale
 // heightmaps rendering correctly, and costs almost nothing because the sections
 // above terrain are exactly the ones that get skipped wholesale.
+// scanColumnOres walks one column's full depth and records the most valuable
+// ore in it plus how many ore blocks it holds, for the ore-heatmap style.
+//
+// This is a separate downward pass rather than part of the surface scan
+// above, because the two want different things: the surface scan stops the
+// moment it finds the first solid block, while an ore summary is only
+// meaningful once the whole column beneath that has been examined. It is
+// skipped entirely unless ore scanning is enabled (see World.scanOres), so a
+// deployment that never opens the ore style pays nothing for it.
+//
+// Sections that are wholly transparent are skipped a section at a time, the
+// same trick the surface scan uses, which is what keeps the cost of walking
+// the empty air above terrain negligible.
+func (w *World) scanColumnOres(dc *decodedChunk, cs *world.ChunkSurface, x, z, i, bottomY, topY int) {
+	best := world.OreNone
+	score := 0
+	for y := topY; y >= bottomY; y-- {
+		sy := mcmath.FloorDiv(y, 16)
+		sec, ok := dc.sections[sy]
+		if !ok || sec.allTransparent {
+			y = sy * 16 // the loop's own decrement carries it below this section
+			continue
+		}
+		pe := sec.blockAt(x, mcmath.FloorMod(y, 16), z)
+		if pe.ore == world.OreNone {
+			continue
+		}
+		if pe.ore > best {
+			best = pe.ore
+		}
+		score += pe.ore.Points()
+	}
+	cs.OreBest[i] = uint8(best)
+	if score > 255 {
+		score = 255
+	}
+	cs.OreScore[i] = uint8(score)
+}
+
 func (w *World) surface(dc *decodedChunk, dim world.DimensionInfo) *world.ChunkSurface {
 	cs := &world.ChunkSurface{Pos: dc.pos}
 	if dc.empty {
@@ -500,6 +568,10 @@ func (w *World) surface(dc *decodedChunk, dim world.DimensionInfo) *world.ChunkS
 				cs.Block[i] = pe.id
 				cs.Decoration[i] = decorID
 				cs.Light[i] = sec.lightAt(x, min(ly+1, 15), z)
+				// Sampled one block above the surface -- the air a mob would
+				// actually stand in, not the solid block itself, which is
+				// always dark.
+				cs.BlockLight[i] = sec.blockLightAt(x, min(ly+1, 15), z)
 				cs.Flags[i] = world.FlagPresent
 				if inWater && waterTop > y {
 					cs.Flags[i] |= world.FlagWater
@@ -510,6 +582,10 @@ func (w *World) surface(dc *decodedChunk, dim world.DimensionInfo) *world.ChunkS
 				}
 				found = true
 				break
+			}
+
+			if w.scanOres {
+				w.scanColumnOres(dc, cs, x, z, i, bottomY, topY)
 			}
 
 			if !found {

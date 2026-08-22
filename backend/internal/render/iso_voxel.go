@@ -18,7 +18,11 @@ import (
 // this ordering is safe; do not change the sweep direction without rerunning
 // it.
 func (r *Iso) renderVoxel(pos mcmath.TilePos, surf *world.Surface) *image.NRGBA {
-	img := FillUnexplored(r.Shader.Opts.UnexploredColor)
+	fill := r.Shader.Opts.UnexploredColor
+	if r.Shader.Style == StyleContour {
+		fill = color.NRGBA{}
+	}
+	img := FillUnexplored(fill)
 
 	ppu := int(mcmath.PixelsPerBlock(pos.Zoom))
 	if pos.Zoom < MinDirectZoom || ppu < 2 {
@@ -61,6 +65,12 @@ func (r *Iso) renderVoxel(pos mcmath.TilePos, surf *world.Surface) *image.NRGBA 
 
 // drawVoxelColumn draws every stored voxel of one column, bottom-up, plus
 // the basement skirt below the stored slab.
+//
+// The self, left and right neighbour chunk pointers are each resolved once
+// here rather than per voxel: a column's whole vertical loop, and every one
+// of its per-voxel occlusion probes against the same two neighbour columns,
+// touch exactly three columns in total, not one per Y level (PERF_PLAN.md
+// §6, "reuse the chunk pointer per column").
 func (r *Iso) drawVoxelColumn(
 	img *image.NRGBA,
 	surf *world.Surface,
@@ -70,9 +80,9 @@ func (r *Iso) drawVoxelColumn(
 	col world.Column,
 ) {
 	vol := r.Volume
-	rawTop, ok := vol.TopY(x, z)
-	top, _ := r.sliceTopY(vol, x, z)
-	depth := vol.Depth(x, z)
+	self := vol.ColumnAt(x, z)
+	rawTop, ok := self.TopY()
+	depth := self.Depth()
 	if !ok || depth <= 0 {
 		// The column's chunk was not loaded into the volume window at all.
 		// Should not happen given the window is derived the same way as the
@@ -80,6 +90,10 @@ func (r *Iso) drawVoxelColumn(
 		// safe onto the heightmap skirt rather than drawing nothing.
 		r.drawColumn(img, surf, ib, ppu, w, h, a, b, x, z, col)
 		return
+	}
+	top := rawTop
+	if r.Sliced && top > r.SliceY {
+		top = r.SliceY
 	}
 	// Depth is measured from the column's real top, so the floor must be too:
 	// the slice only hides what is above it and never moves the stored slab.
@@ -92,6 +106,11 @@ func (r *Iso) drawVoxelColumn(
 	}
 	reg := r.Shader.Blocks
 
+	lx, lz := r.Proj.Camera.UnrotateInt(a, b+1)
+	rx, rz := r.Proj.Camera.UnrotateInt(a+1, b)
+	left := vol.ColumnAt(lx, lz)
+	right := vol.ColumnAt(rx, rz)
+
 	// A decoration (grass, flower, sapling, crop) is never its own voxel --
 	// ISO_VOXEL_PLAN.md §4.4 and HANDOFF.md §4's "never on a side face"
 	// invariant both apply just as much to the voxel path. If the column's
@@ -100,13 +119,13 @@ func (r *Iso) drawVoxelColumn(
 	drawTop := top
 	var decorID uint16
 	var decorLight uint8
-	if id, light, ok := r.sliceBlockAt(vol, x, top, z); ok && id != 0 && reg.Get(id).Decoration {
+	if id, light, ok := r.sliceColumnBlockAt(self, top); ok && id != 0 && reg.Get(id).Decoration {
 		decorID, decorLight = id, light
 		drawTop = top - 1
 	}
 
 	for y := floor; y <= drawTop; y++ {
-		id, light, ok := r.sliceBlockAt(vol, x, y, z)
+		id, light, ok := r.sliceColumnBlockAt(self, y)
 		if !ok || id == 0 {
 			continue // air, or a gap the descent never wrote
 		}
@@ -115,7 +134,7 @@ func (r *Iso) drawVoxelColumn(
 			continue // a stray decoration below the column top: still not its own voxel
 		}
 
-		topFace, leftFace, rightFace := r.voxelFaceVisibility(vol, a, b, x, y, z)
+		topFace, leftFace, rightFace := r.voxelFaceVisibility(self, left, right, y)
 		if !topFace && !leftFace && !rightFace {
 			continue
 		}
@@ -128,7 +147,8 @@ func (r *Iso) drawVoxelColumn(
 		isColumnTop := y == drawTop
 
 		r.drawVoxel(img, surf, ib, ppu, w, h, a, b, x, y, z,
-			id, light, topFace, leftFace, rightFace, isColumnTop, vDecorID, vDecorLight)
+			id, light, topFace, leftFace, rightFace, isColumnTop, vDecorID, vDecorLight,
+			blockHeight(blk))
 	}
 
 	r.drawBasementSkirt(img, surf, ib, ppu, w, h, a, b, x, z, floor)
@@ -140,18 +160,18 @@ func (r *Iso) drawVoxelColumn(
 // definition of "what's visible" while testing "in what order" separately.
 //
 // Matches iso.go's screen-left/screen-right convention exactly: screen-left
-// is the +b neighbour, screen-right is the +a neighbour.
-func (r *Iso) voxelFaceVisibility(vol *world.Volume, a, b, x, y, z int) (top, left, right bool) {
-	top = !r.voxelOccludes(vol, x, y+1, z)
-	lx, lz := r.Proj.Camera.UnrotateInt(a, b+1)
-	left = !r.voxelOccludes(vol, lx, y, lz)
-	rx, rz := r.Proj.Camera.UnrotateInt(a+1, b)
-	right = !r.voxelOccludes(vol, rx, y, rz)
+// is the +b neighbour, screen-right is the +a neighbour. self/left/right are
+// resolved once per column by the caller (drawVoxelColumn), not re-derived
+// here, since all three stay the same chunk for every y in that column.
+func (r *Iso) voxelFaceVisibility(self, left, right world.ColumnVoxels, y int) (top, lf, rf bool) {
+	top = !r.voxelOccludesCol(self, y+1)
+	lf = !r.voxelOccludesCol(left, y)
+	rf = !r.voxelOccludesCol(right, y)
 	return
 }
 
-// sliceBlockAt is Volume.BlockAt with the Y slice applied: anything above
-// SliceY reads as air rather than as whatever is really there.
+// sliceColumnBlockAt is ColumnVoxels.At with the Y slice applied: anything
+// above SliceY reads as air rather than as whatever is really there.
 //
 // It reports ok=true for those positions, not ok=false. The two answers mean
 // different things to the occlusion predicate -- ok=false is "unknown, so
@@ -160,43 +180,49 @@ func (r *Iso) voxelFaceVisibility(vol *world.Volume, a, b, x, y, z int) (top, le
 // here is what makes the cut face visible: without it the terrain still
 // standing above the slice would go on hiding the top face of the voxel the
 // slice exposes, and the cut would render as a hole.
-func (r *Iso) sliceBlockAt(vol *world.Volume, x, y, z int) (uint16, uint8, bool) {
+func (r *Iso) sliceColumnBlockAt(col world.ColumnVoxels, y int) (uint16, uint8, bool) {
 	if r.Sliced && y > r.SliceY {
 		return 0, 0, true
 	}
-	return vol.BlockAt(x, y, z)
+	return col.At(y)
 }
 
-// sliceTopY is Volume.TopY clamped to the slice, so a column that continues
-// above the cut is drawn as though it ended there.
-func (r *Iso) sliceTopY(vol *world.Volume, x, z int) (int, bool) {
-	top, ok := vol.TopY(x, z)
-	if ok && r.Sliced && top > r.SliceY {
-		top = r.SliceY
-	}
-	return top, ok
-}
-
-// voxelOccludes reports whether the block at a world position fully hides
-// what is behind it. ok=false from Volume.BlockAt -- outside the stored slab
-// or ungenerated -- must never be treated as occluding: guessing "occluded"
-// punches holes in the image, while guessing "not occluded" only costs a few
-// extra drawn faces that get overpainted (ISO_VOXEL_PLAN.md §4.3, §8).
+// voxelOccludesCol reports whether the block at a column's world Y fully
+// hides what is behind it. ok=false from ColumnVoxels.At -- outside the
+// stored slab or ungenerated -- must never be treated as occluding: guessing
+// "occluded" punches holes in the image, while guessing "not occluded" only
+// costs a few extra drawn faces that get overpainted (ISO_VOXEL_PLAN.md
+// §4.3, §8).
 //
-// HasTexture is called before reading Occludes, not just when sampling a
-// face's colour, because Block.Occludes can be downgraded by real texture
-// alpha the first time a block's texture is resolved (§5 Phase 4,
-// textures.Set.Get -> Registry.DowngradeOccludes). Without forcing that
-// resolution here too, the very first occlusion check for a given block id
-// in the process's lifetime could run before its own face-sampling step
-// resolves it, using the stale flag-derived value for that one check.
-func (r *Iso) voxelOccludes(vol *world.Volume, x, y, z int) bool {
-	id, _, ok := r.sliceBlockAt(vol, x, y, z)
+// The result is cached per block id for the rest of this tile's render
+// (Iso.occludesCache, PERF_PLAN.md §6): both Shader.HasTexture and
+// Blocks.Get take a lock over their own id-keyed map, and a tile's occlusion
+// scan revisits the same handful of distinct ids far more often than it
+// meets a new one. HasTexture is still resolved before Occludes is read on
+// that first, uncached visit -- not just when sampling a face's colour --
+// because Block.Occludes can be downgraded by real texture alpha the first
+// time a block's texture is resolved (§5 Phase 4, textures.Set.Get ->
+// Registry.DowngradeOccludes); caching only the final Occludes value means
+// that ordering only has to happen once per id, not once per voxel.
+func (r *Iso) voxelOccludesCol(col world.ColumnVoxels, y int) bool {
+	id, _, ok := r.sliceColumnBlockAt(col, y)
 	if !ok || id == 0 {
 		return false
 	}
+	if occ, cached := r.occludesCache[id]; cached {
+		return occ
+	}
 	r.Shader.HasTexture(id)
-	return r.Shader.Blocks.Get(id).Occludes
+	blk := r.Shader.Blocks.Get(id)
+	// A block that does not fill its cell cannot hide its neighbour: a slab
+	// or a stair leaves the upper half of the face behind it in plain view,
+	// and treating it as opaque punches that half out of the image.
+	occ := blk.Occludes && blockHeight(blk) >= 1
+	if r.occludesCache == nil {
+		r.occludesCache = make(map[uint16]bool, 32)
+	}
+	r.occludesCache[id] = occ
+	return occ
 }
 
 // drawVoxel rasterises one voxel's visible faces: the same top-face diamond
@@ -204,6 +230,13 @@ func (r *Iso) voxelOccludes(vol *world.Volume, x, y, z int) bool {
 // exactly one change per ISO_VOXEL_PLAN.md §4.2 -- a side face is now
 // exactly one Y level tall (ppu pixels) at this voxel's own y, rather than a
 // depthPx-tall run of the surface block's texture tiled once per level.
+//
+// blockH is the block's real height in blocks (Block.Height): 1 for an
+// ordinary cube, 0.5 for a slab or a stair. It moves the top face down by the
+// missing fraction and shortens the side faces to match, which is what stops
+// slabs and stairs standing a full block tall. The top face's own diamond is
+// unchanged in shape -- only where it sits -- so the lattice still tessellates
+// exactly (see Iso's "Diamond tessellation" note).
 func (r *Iso) drawVoxel(
 	img *image.NRGBA,
 	surf *world.Surface,
@@ -213,16 +246,25 @@ func (r *Iso) drawVoxel(
 	blockID uint16, light uint8,
 	topFace, leftFace, rightFace, isColumnTop bool,
 	decorID uint16, decorLight uint8,
+	blockH float64,
 ) {
 	ppuF := float64(ppu)
 
+	// Side faces reach from the block's own top down to the bottom of its
+	// cell. At least one pixel, so a very thin block (a carpet) still reads as
+	// having a side rather than vanishing edge-on.
+	sidePx := int(math.Round(blockH * ppuF))
+	if sidePx < 1 {
+		sidePx = 1
+	}
+
 	u := float64(a-b) * mcmath.IsoHalfWidth
-	v := float64(a+b)*mcmath.IsoHalfHeight - float64(y+1)*mcmath.IsoBlockHeight
+	v := float64(a+b)*mcmath.IsoHalfHeight - (float64(y)+blockH)*mcmath.IsoBlockHeight
 	topPx := int(math.Round((u - ib.MinU) * ppuF))
 	topPy := int(math.Round((v - ib.MinV) * ppuF))
 	left := topPx - w/2
 
-	if left >= mcmath.TileSize || left+w <= 0 || topPy >= mcmath.TileSize || topPy+h+ppu <= 0 {
+	if left >= mcmath.TileSize || left+w <= 0 || topPy >= mcmath.TileSize || topPy+h+sidePx <= 0 {
 		return
 	}
 
@@ -272,15 +314,32 @@ func (r *Iso) drawVoxel(
 		if !faceOn {
 			continue
 		}
-		for k := 1; k <= ppu; k++ {
+		for k := 1; k <= sidePx; k++ {
 			py := topPy + jHi + k
 			if py >= mcmath.TileSize {
 				break
 			}
-			tv := k - 1
+			// Texel row still walks the full-block texture so a half-height
+			// block shows the top half of its side texture, not a squashed
+			// copy of the whole thing.
+			tv := (k - 1) % ppu
 			setPixel(img, px, py, blocks.Scale(sampleSide(sideTu, tv), shade))
 		}
 	}
+}
+
+// blockHeight is a block's rendered height in blocks, clamped to (0, 1].
+//
+// blocks.json carries this for slabs, stairs and similar (Block.Height), and
+// until partial-height rendering existed nothing read it, so every one of
+// them was drawn standing a full block tall. A zero or missing value means
+// "not specified", which is a full cube -- not a zero-height one.
+func blockHeight(blk blocks.Block) float64 {
+	h := float64(blk.Height)
+	if h <= 0 || h > 1 {
+		return 1
+	}
+	return h
 }
 
 // drawBasementSkirt extends a column's side faces below the stored voxel

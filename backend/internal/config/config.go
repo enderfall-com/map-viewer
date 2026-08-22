@@ -93,6 +93,11 @@ type Tiles struct {
 	Styles []string `yaml:"styles"`
 	// Modes are the projections to generate and serve.
 	Modes []string `yaml:"modes"`
+	// MaxSliceVariants bounds how many distinct Y-slice levels' tiles stay on
+	// disk per (dimension, mode, camera) family before the least-recently-used
+	// one is evicted (PERF_PLAN.md §5.1). <= 0 uses tiles.DefaultConfig's
+	// default rather than being unbounded.
+	MaxSliceVariants int `yaml:"maxSliceVariants"`
 }
 
 // MapCfg holds client-facing map defaults.
@@ -149,6 +154,11 @@ type Render struct {
 	MaxWaterDepth     float64 `yaml:"maxWaterDepth"`
 	LightShading      bool    `yaml:"lightShading"`
 	UnexploredColor   string  `yaml:"unexploredColor"`
+	Contour           bool    `yaml:"contour"`
+	ContourInterval   int     `yaml:"contourInterval"`
+	ContourMajorEvery int     `yaml:"contourMajorEvery"`
+	ContourColor      string  `yaml:"contourColor"`
+	ContourMajorColor string  `yaml:"contourMajorColor"`
 	IsoCamera         string  `yaml:"isoCamera"`
 	IsoEdgeSkirt      int     `yaml:"isoEdgeSkirt"`
 
@@ -165,6 +175,12 @@ type Render struct {
 	// depth regardless of IsoVoxelBelowGround.
 	IsoVoxelMinDepth int `yaml:"isoVoxelMinDepth"`
 	IsoVoxelMaxDepth int `yaml:"isoVoxelMaxDepth"`
+
+	// OreScan makes the chunk reader summarise each column's ore content so
+	// the "ore" render style has data to draw. It adds a full-depth walk per
+	// column the first time each chunk is decoded, so it is opt-in; with it
+	// off the ore style renders empty.
+	OreScan bool `yaml:"oreScan"`
 }
 
 // Data points at the block and biome colour files.
@@ -250,6 +266,7 @@ func Default() Config {
 			MemoryCacheBytes: 192 << 20, StoreBlankTiles: false,
 			Pregenerate: false, PregenerateMaxZoom: 6,
 			Styles: []string{"terrain"}, Modes: []string{"top", "iso"},
+			MaxSliceVariants: 12,
 		},
 		Map: MapCfg{
 			MinZoom: 0, MaxZoom: 10, DefaultZoom: 5,
@@ -268,7 +285,10 @@ func Default() Config {
 			AmbientHeight: 0.10, BiomeTint: true,
 			WaterDepthShading: true, MaxWaterDepth: 28, LightShading: false,
 			UnexploredColor: "#14161a", IsoCamera: "se", IsoEdgeSkirt: 4,
+			Contour: false, ContourInterval: 8, ContourMajorEvery: 4,
+			ContourColor: "#4a33209b", ContourMajorColor: "#6b4828e6",
 			IsoVoxel: true, IsoVoxelBelowGround: 16, IsoVoxelMinDepth: 8, IsoVoxelMaxDepth: 64,
+			OreScan: false,
 		},
 		Data: Data{
 			BlocksFile: "./config/blocks.json",
@@ -414,6 +434,7 @@ func (c *Config) RenderOptions() (render.Options, error) {
 	opts.BiomeTint = c.Render.BiomeTint
 	opts.WaterDepthShading = c.Render.WaterDepthShading
 	opts.LightShading = c.Render.LightShading
+	opts.Contour = c.Render.Contour
 	if c.Render.ShadingStrength > 0 {
 		opts.ShadingStrength = c.Render.ShadingStrength
 	}
@@ -426,12 +447,32 @@ func (c *Config) RenderOptions() (render.Options, error) {
 	if c.Render.MaxWaterDepth > 0 {
 		opts.MaxWaterDepth = c.Render.MaxWaterDepth
 	}
+	if c.Render.ContourInterval > 0 {
+		opts.ContourInterval = c.Render.ContourInterval
+	}
+	if c.Render.ContourMajorEvery > 0 {
+		opts.ContourMajorEvery = c.Render.ContourMajorEvery
+	}
 	if c.Render.UnexploredColor != "" {
 		col, err := parseHex(c.Render.UnexploredColor)
 		if err != nil {
 			return opts, fmt.Errorf("render.unexploredColor: %w", err)
 		}
 		opts.UnexploredColor = col
+	}
+	if c.Render.ContourColor != "" {
+		col, err := parseHex(c.Render.ContourColor)
+		if err != nil {
+			return opts, fmt.Errorf("render.contourColor: %w", err)
+		}
+		opts.ContourColor = col
+	}
+	if c.Render.ContourMajorColor != "" {
+		col, err := parseHex(c.Render.ContourMajorColor)
+		if err != nil {
+			return opts, fmt.Errorf("render.contourMajorColor: %w", err)
+		}
+		opts.ContourMajorColor = col
 	}
 	return opts, nil
 }

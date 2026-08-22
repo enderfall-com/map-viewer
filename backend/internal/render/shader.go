@@ -25,17 +25,116 @@ const (
 	StyleBiome Style = "biome"
 	// StyleHeight paints an elevation gradient, for reading terrain relief.
 	StyleHeight Style = "height"
+	// StyleLight paints a mob-spawn safety map from block light alone: where
+	// the world is dark enough for hostile mobs to spawn after dusk.
+	StyleLight Style = "light"
+	// StyleOre paints each column by the most valuable ore anywhere beneath
+	// it, for deciding where to dig.
+	StyleOre Style = "ore"
+	// StyleContour paints transparent tiles with elevation contour lines only,
+	// for use as a client-side raster overlay.
+	StyleContour Style = "contour"
 )
 
 // ParseStyle resolves a style name, falling back to terrain.
 func ParseStyle(s string) (Style, bool) {
 	switch Style(s) {
-	case StyleTerrain, StyleBiome, StyleHeight:
+	case StyleTerrain, StyleBiome, StyleHeight, StyleLight, StyleOre, StyleContour:
 		return Style(s), true
 	case "":
 		return StyleTerrain, true
 	}
 	return StyleTerrain, false
+}
+
+// Spawn-safety thresholds for StyleLight.
+//
+// Modern Minecraft (1.18+) spawns hostile mobs only at block light 0, so that
+// is the one threshold that genuinely matters and it gets the alarming
+// colour. Levels 1..7 are drawn as a caution band rather than lumped in with
+// "safe": they are safe now, but they were spawnable before 1.18 and they are
+// one removed torch away from being spawnable again, which is exactly what
+// someone lighting up a base wants to see.
+const (
+	spawnableLight = 0
+	cautionLight   = 7
+)
+
+// oreColors is each OreKind's map colour, chosen to match the ore's own
+// in-game appearance so the legend is guessable without one.
+var oreColors = [...]color.NRGBA{
+	world.OreNone:     {0x1b, 0x1e, 0x24, 0xff}, // near-background: nothing here
+	world.OreOther:    {0xa8, 0x8c, 0xc0, 0xff}, // unknown/modded: neutral violet
+	world.OreCoal:     {0x3d, 0x43, 0x4d, 0xff},
+	world.OreCopper:   {0xc8, 0x7b, 0x4a, 0xff},
+	world.OreIron:     {0xd8, 0xb0, 0x8c, 0xff},
+	world.OreLapis:    {0x2c, 0x5a, 0xc4, 0xff},
+	world.OreRedstone: {0xd0, 0x2a, 0x2a, 0xff},
+	world.OreGold:     {0xf0, 0xc2, 0x3a, 0xff},
+	world.OreEmerald:  {0x2c, 0xd4, 0x6a, 0xff},
+	world.OreDiamond:  {0x4d, 0xe0, 0xdc, 0xff},
+	world.OreDebris:   {0x7a, 0x4a, 0x3c, 0xff},
+}
+
+// oreScoreSaturates is the column score that paints an ore at full strength.
+// One diamond block scores 12, so a single diamond already reads clearly and
+// a proper vein saturates -- which is the intent, since the map exists to
+// find the first one, not to grade the size of the deposit.
+const oreScoreSaturates = 16.0
+
+// oreStyleColor paints a column's ore summary over a desaturated rendering of
+// the terrain itself.
+//
+// Keeping the terrain visible underneath is deliberate: an abstract field of
+// ore colours is impossible to navigate, because nothing in it says which
+// coastline or which base you are looking at. Draining the terrain of colour
+// leaves the shape of the world legible as context while surrendering the
+// entire colour channel to the ore on top.
+//
+// Intensity comes from the rarity-weighted score rather than from which ore
+// is present, so the common ores fade out entirely (they score zero) instead
+// of colouring every pixel; the hue is still the best ore in the column, so a
+// bright spot also says what it is.
+func (s *Shader) oreStyleColor(surf *world.Surface, c world.Column) color.NRGBA {
+	base := desaturate(s.terrainColor(surf, c), 0.88)
+	if c.OreScore == 0 {
+		return base
+	}
+	best := c.OreBest
+	if int(best) >= len(oreColors) {
+		best = world.OreOther
+	}
+	w := math.Min(1, float64(c.OreScore)/oreScoreSaturates)
+	return blocks.Lerp(base, oreColors[best], w)
+}
+
+// desaturate pulls a colour toward its own luminance. amount 0 leaves it
+// untouched, 1 makes it fully grey.
+func desaturate(col color.NRGBA, amount float64) color.NRGBA {
+	// Rec. 601 luma: matches how the eye weights the channels, so terrain
+	// keeps its relative light and dark rather than flattening out.
+	y := 0.299*float64(col.R) + 0.587*float64(col.G) + 0.114*float64(col.B)
+	grey := color.NRGBA{uint8(y + 0.5), uint8(y + 0.5), uint8(y + 0.5), col.A}
+	return blocks.Lerp(col, grey, amount)
+}
+
+// lightStyleColor maps a column's block light to its spawn-safety colour.
+func lightStyleColor(blockLight uint8) color.NRGBA {
+	switch {
+	case blockLight <= spawnableLight:
+		return color.NRGBA{0xe0, 0x3b, 0x3b, 0xff} // red: mobs spawn here
+	case blockLight <= cautionLight:
+		// Ramp amber -> yellow across the caution band so the edge of a
+		// torch's reach is legible rather than one flat colour.
+		t := float64(blockLight-spawnableLight-1) / float64(cautionLight-spawnableLight-1)
+		return blocks.Lerp(color.NRGBA{0xe8, 0x8a, 0x2a, 0xff}, color.NRGBA{0xe8, 0xd0, 0x44, 0xff}, t)
+	default:
+		// Comfortably lit: a calm green that darkens slightly toward the
+		// threshold, so "just barely safe" still reads differently from
+		// "brightly lit".
+		t := float64(blockLight-cautionLight) / float64(15-cautionLight)
+		return blocks.Lerp(color.NRGBA{0x2f, 0x6d, 0x4a, 0xff}, color.NRGBA{0x54, 0xc9, 0x82, 0xff}, t)
+	}
 }
 
 // Options tunes the visual treatment. Zero values are not useful; use
@@ -64,6 +163,16 @@ type Options struct {
 	LightShading bool
 	// UnexploredColor fills columns with no world data.
 	UnexploredColor color.NRGBA
+	// Contour enables StyleContour output.
+	Contour bool
+	// ContourInterval is the world-Y spacing between minor contour lines.
+	ContourInterval int
+	// ContourMajorEvery makes every Nth minor contour an index line.
+	ContourMajorEvery int
+	// ContourColor is the minor contour line colour.
+	ContourColor color.NRGBA
+	// ContourMajorColor is the index contour line colour.
+	ContourMajorColor color.NRGBA
 	// HeightGradient defines the StyleHeight ramp from low to high.
 	HeightGradient []color.NRGBA
 }
@@ -82,6 +191,11 @@ func DefaultOptions() Options {
 		MaxWaterDepth:     28,
 		LightShading:      false,
 		UnexploredColor:   color.NRGBA{0x14, 0x16, 0x1a, 0xff},
+		Contour:           false,
+		ContourInterval:   8,
+		ContourMajorEvery: 4,
+		ContourColor:      color.NRGBA{0x4a, 0x33, 0x20, 0x9b},
+		ContourMajorColor: color.NRGBA{0x6b, 0x48, 0x28, 0xe6},
 		HeightGradient: []color.NRGBA{
 			{0x0b, 0x1b, 0x3a, 0xff}, // deep
 			{0x1c, 0x4c, 0x6b, 0xff},
@@ -123,6 +237,9 @@ func NewShader(reg *blocks.Registry, bio *blocks.Biomes, style Style) *Shader {
 // Absent columns return false and must be drawn as unexplored, not as black.
 func (s *Shader) ColumnColor(surf *world.Surface, x, z int) (color.NRGBA, bool) {
 	c := surf.At(x, z)
+	if s.Style == StyleContour {
+		return s.contourColor(surf, x, z, c)
+	}
 	if !c.Present() {
 		return s.Opts.UnexploredColor, false
 	}
@@ -153,13 +270,27 @@ func (s *Shader) baseColor(surf *world.Surface, c world.Column) color.NRGBA {
 		t := float64(c.RenderY()-lo) / float64(max(1, hi-lo))
 		return sampleGradient(s.Opts.HeightGradient, t)
 
+	case StyleLight:
+		return lightStyleColor(c.BlockLight)
+
+	case StyleOre:
+		return s.oreStyleColor(surf, c)
+
 	default: // StyleTerrain
-		col := s.blockColor(c.Block, c, 1, 0, 0)
-		if c.Water() {
-			col = s.waterColor(col, c, s.Biomes.Get(c.Biome))
-		}
-		return col
+		return s.terrainColor(surf, c)
 	}
+}
+
+// terrainColor is the natural-colour rendering of a column, independent of
+// the active style. Split out from baseColor's terrain branch because the ore
+// style draws over a desaturated copy of it, and would otherwise recurse
+// through baseColor back into itself.
+func (s *Shader) terrainColor(_ *world.Surface, c world.Column) color.NRGBA {
+	col := s.blockColor(c.Block, c, 1, 0, 0)
+	if c.Water() {
+		col = s.waterColor(col, c, s.Biomes.Get(c.Biome))
+	}
+	return col
 }
 
 // topColor is baseColor with any Decoration (grass, flower, sapling, crop)
@@ -220,7 +351,21 @@ const (
 // one of a diamond's 100+ pixels or a magnified block's 256 texels only to
 // discard the (tu,tv) they never needed.
 func (s *Shader) FaceSampler(surf *world.Surface, x, z int, face FaceKind, mipSize int) (sample func(tu, tv int) color.NRGBA, present bool) {
+	transparent := func(_, _ int) color.NRGBA { return color.NRGBA{} }
 	c := surf.At(x, z)
+	if s.Style == StyleContour {
+		if !c.Present() {
+			return transparent, false
+		}
+		if face != FaceKindTop {
+			return transparent, true
+		}
+		col, ok := s.contourColor(surf, x, z, c)
+		if !ok {
+			return transparent, true
+		}
+		return func(_, _ int) color.NRGBA { return col }, true
+	}
 	if !c.Present() {
 		u := s.Opts.UnexploredColor
 		return func(_, _ int) color.NRGBA { return u }, false
@@ -290,6 +435,17 @@ func (s *Shader) VoxelSampler(
 	blockID uint16, light uint8,
 	face FaceKind, isColumnTop bool, mipSize int,
 ) func(tu, tv int) color.NRGBA {
+	if s.Style == StyleContour {
+		if face != FaceKindTop || !isColumnTop {
+			return func(_, _ int) color.NRGBA { return color.NRGBA{} }
+		}
+		col, ok := s.contourColor(surf, x, z, surf.At(x, z))
+		if !ok {
+			return func(_, _ int) color.NRGBA { return color.NRGBA{} }
+		}
+		return func(_, _ int) color.NRGBA { return col }
+	}
+
 	applyRelief := s.Opts.HeightShading && face == FaceKindTop && isColumnTop
 	relief := 1.0
 	if applyRelief {
@@ -334,6 +490,15 @@ func (s *Shader) voxelColumn(surf *world.Surface, x, z int, blockID uint16, ligh
 // voxelBaseColor is blockColor for a specific voxel, with water compositing
 // applied using the column's own WaterDepth (see VoxelSampler's doc comment).
 func (s *Shader) voxelBaseColor(surf *world.Surface, x, z int, blockID uint16) color.NRGBA {
+	// Every style except terrain describes the *column* (its biome, its
+	// elevation, whether mobs can spawn on it), not the individual block, so
+	// it resolves identically for every voxel in the column -- and must, or
+	// the isometric view would disagree with top-down about what a style
+	// means, which is exactly what routing both renderers through one Shader
+	// exists to prevent.
+	if s.Style != StyleTerrain {
+		return s.baseColor(surf, surf.At(x, z))
+	}
 	vc := s.voxelColumn(surf, x, z, blockID, 0)
 	col := s.blockColor(blockID, vc, 1, 0, 0)
 	if s.Blocks.Get(blockID).Water {
@@ -552,6 +717,49 @@ func neighbourHeight(surf *world.Surface, x, z int) (float64, bool) {
 		return 0, false
 	}
 	return float64(c.RenderY()), true
+}
+
+// contourColor reports the contour-line colour for one surface column. Lines
+// are drawn where this column crosses an elevation interval boundary relative
+// to its north or west neighbour, matching reliefFactor's neighbour convention.
+func (s *Shader) contourColor(surf *world.Surface, x, z int, c world.Column) (color.NRGBA, bool) {
+	if !s.Opts.Contour || !c.Present() {
+		return color.NRGBA{}, false
+	}
+	interval := s.Opts.ContourInterval
+	if interval <= 0 {
+		interval = 8
+	}
+	majorEvery := s.Opts.ContourMajorEvery
+	if majorEvery <= 0 {
+		majorEvery = 4
+	}
+
+	hLevel := int(math.Floor(float64(c.RenderY()) / float64(interval)))
+	major := false
+	crossed := false
+	for _, n := range [][2]int{{x, z - 1}, {x - 1, z}} {
+		nh, ok := neighbourHeight(surf, n[0], n[1])
+		if !ok {
+			continue
+		}
+		nLevel := int(math.Floor(nh / float64(interval)))
+		if hLevel == nLevel {
+			continue
+		}
+		boundary := min(hLevel, nLevel) + 1
+		if boundary%majorEvery == 0 {
+			major = true
+		}
+		crossed = true
+	}
+	if !crossed {
+		return color.NRGBA{}, false
+	}
+	if major {
+		return s.Opts.ContourMajorColor, true
+	}
+	return s.Opts.ContourColor, true
 }
 
 // lightFactor maps stored light 0..15 onto a brightness multiplier. Fully lit

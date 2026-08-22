@@ -109,9 +109,6 @@ export class PlayerLayer {
   private readonly bodyAnchor = playerBodyAnchor();
   private animating = false;
   private visible = true;
-  /** The player the view is locked onto, re-centred on every update -- or
-   * `null` when nothing is being followed. */
-  private followingUuid: string | null = null;
 
   constructor(engine: MapEngine) {
     this.engine = engine;
@@ -209,19 +206,10 @@ export class PlayerLayer {
           this.source.removeFeature(f);
           this.features.delete(uuid);
         }
-        if (this.followingUuid === uuid) this.followingUuid = null;
         anyChanged = true;
       }
     }
     if (anyChanged) this.ensureAnimating();
-
-    // The map re-centres on every update rather than just once, so following
-    // reads as tracking a moving target instead of a one-shot jump.
-    if (this.followingUuid) {
-      const t = this.tracked.get(this.followingUuid);
-      if (t) this.engine.centerOnBlock(t.toX, t.toZ, t.toY, false);
-      else this.followingUuid = null;
-    }
   }
 
   /** Removes every tracked player, e.g. when switching dimension. */
@@ -229,11 +217,10 @@ export class PlayerLayer {
     this.tracked.clear();
     this.features.clear();
     this.source.clear(true);
-    this.followingUuid = null;
   }
 
   /** Hit-tests a viewport pixel against player markers only, for click-to-
-   * follow -- distinct from the generic block `pickAt`, which resolves
+   * jump-to -- distinct from the generic block `pickAt`, which resolves
    * terrain, not overlay features. */
   hitTest(pixel: number[]): Player | null {
     let found: Player | null = null;
@@ -246,27 +233,6 @@ export class PlayerLayer {
       { layerFilter: (l) => l === this.layer, hitTolerance: 6 },
     );
     return found;
-  }
-
-  /** Toggles following a player by uuid; clicking the same one again stops.
-   * Returns whether the view is now following (vs. having just stopped). */
-  toggleFollow(uuid: string): boolean {
-    this.followingUuid = this.followingUuid === uuid ? null : uuid;
-    return this.followingUuid !== null;
-  }
-
-  stopFollowing(): void {
-    this.followingUuid = null;
-  }
-
-  isFollowing(): boolean {
-    return this.followingUuid !== null;
-  }
-
-  /** The display name of whoever is being followed, for a status tip. */
-  followedName(): string | null {
-    if (!this.followingUuid) return null;
-    return this.tracked.get(this.followingUuid)?.player.name ?? null;
   }
 
   private progress(t: TrackedPlayer, now: number): number {
@@ -396,7 +362,6 @@ export class PlayerLayer {
     const p = f.get('player') as Player;
     const zoom = this.engine.zoom();
     const showLabel = zoom >= this.engine.config.overlays.labelsMinZoom - 1;
-    const following = p?.uuid === this.followingUuid;
     const mode = this.engine.getMode();
 
     let image: Icon | undefined;
@@ -430,14 +395,13 @@ export class PlayerLayer {
             font: '600 12px Inter, system-ui, sans-serif',
             fill: new Fill({ color: '#ffffff' }),
             backgroundFill: new Fill({ color: 'rgba(10,12,20,0.55)' }),
-            backgroundStroke: following ? new Stroke({ color: '#ffffff', width: 1.5 }) : undefined,
             padding: [3, 6, 3, 6],
           })
         : new Text({
             text: p?.name ?? '',
             offsetY: labelOffsetY,
             font: '600 12px Inter, system-ui, sans-serif',
-            fill: new Fill({ color: following ? '#ffffff' : '#ffe9a8' }),
+            fill: new Fill({ color: '#ffe9a8' }),
             stroke: new Stroke({ color: 'rgba(6,8,12,0.92)', width: 3 }),
           })
       : undefined;

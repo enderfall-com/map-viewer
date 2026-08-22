@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -56,10 +58,14 @@ type Request struct {
 	Camera mcmath.IsoCamera
 
 	// Sliced and SliceY cut the isometric view off above a Y level, exposing
-	// caves and interiors. Sliced tiles are never written to the tile store:
-	// there is one variant per level per camera, which would multiply a
-	// world's pyramid by hundreds for a control the user drags through
-	// continuously. They live in the memory cache only.
+	// caves and interiors. Sliced tiles are written to the tile store like
+	// any other variant (PERF_PLAN.md §5.1) -- variant() folds the slice
+	// level into the storage path, so a level the user drags back to is a
+	// lookup, not a re-render. Unbounded slice variants would multiply a
+	// world's pyramid by however many distinct levels have ever been
+	// visited; Manager.sliceVariants bounds that by evicting the
+	// least-recently-used level's tiles once a (dimension, mode, camera)
+	// family holds more than Cfg.MaxSliceVariants of them.
 	Sliced bool
 	SliceY int
 }
@@ -68,11 +74,27 @@ type Request struct {
 // the same area rendered differently within one mode. Empty for anything that
 // matches the historical defaults, so those tiles keep their existing paths
 // and keys rather than being regenerated under new ones.
+//
+// Every new field that affects imagery must be folded in here, not just
+// checked ad hoc at each store call site: childImage and generate both derive
+// their store key from this, so a variant left out here is a variant two
+// different images can silently collide under (PERF_PLAN.md §5.1's own
+// pitfall, hit once already by the camera corner before slice existed).
 func (r Request) variant() string {
-	if r.Mode == ModeIso && r.Camera != mcmath.DefaultCamera {
-		return r.Camera.String()
+	if r.Mode != ModeIso {
+		return ""
 	}
-	return ""
+	v := ""
+	if r.Camera != mcmath.DefaultCamera {
+		v = r.Camera.String()
+	}
+	if r.Sliced {
+		if v != "" {
+			v += "_"
+		}
+		v += "y" + strconv.Itoa(r.SliceY)
+	}
+	return v
 }
 
 // storeKey builds the storage key for a request.
@@ -102,13 +124,6 @@ func (r Request) cacheKey() string {
 	}
 	b.WriteByte('|')
 	b.WriteString(string(r.Style))
-	// In the memory key but deliberately not in variant()/the store path: a
-	// sliced tile must not collide with the unsliced one, but must not be
-	// persisted either.
-	if r.Sliced {
-		b.WriteString("|y")
-		b.WriteString(strconv.Itoa(r.SliceY))
-	}
 	b.WriteByte('|')
 	b.WriteString(strconv.Itoa(r.Pos.Zoom))
 	b.WriteByte('/')
@@ -163,6 +178,11 @@ type Config struct {
 	// the basement skirt fallback simply does a little more work -- it is a
 	// safety margin, not a hard requirement.
 	IsoVoxelMaxDepth int
+	// MaxSliceVariants bounds how many distinct Y-slice levels' tiles are
+	// kept on disk per (dimension, mode, camera) family (PERF_PLAN.md §5.1).
+	// <= 0 uses a sensible default rather than disabling the bound, since an
+	// unbounded value is never what's wanted here.
+	MaxSliceVariants int
 }
 
 // DefaultConfig returns sensible production defaults.
@@ -179,6 +199,7 @@ func DefaultConfig() Config {
 		IsoEdgeSkirt:      4,
 		IsoVoxel:          false,
 		IsoVoxelMaxDepth:  64,
+		MaxSliceVariants:  12,
 	}
 }
 
@@ -222,6 +243,15 @@ type Manager struct {
 	// notice (config.go §6: "log once at info ... never fatal") fires once
 	// per process, not once per tile.
 	voxelUnsupportedLogged atomic.Bool
+
+	// bands holds each dimension's learned isometric render window
+	// (PERF_PLAN.md §4.1/§4.2, heightband.go), keyed by dimension ID.
+	bandsMu sync.Mutex
+	bands   map[string]*heightBand
+
+	// slices bounds how many Y-slice levels' tiles stay on disk per
+	// dimension/mode/camera (PERF_PLAN.md §5.1, slicevariants.go).
+	slices *sliceVariants
 }
 
 // NewManager wires up a tile manager.
@@ -261,6 +291,8 @@ func NewManager(
 		opts:      opts,
 		jobCtx:    jobCtx,
 		jobCancel: jobCancel,
+		bands:     make(map[string]*heightBand),
+		slices:    newSliceVariants(cfg.MaxSliceVariants),
 	}
 }
 
@@ -309,19 +341,27 @@ func (m *Manager) canRenderDirect(mode Mode, zoom int) bool {
 // requests for the same missing tile cause exactly one render.
 func (m *Manager) Tile(ctx context.Context, req Request, prio Priority) ([]byte, error) {
 	m.served.Add(1)
+	// A real browser request is a signal to warm the tiles just outside the
+	// viewport too, so the next pan is more likely to land on one already
+	// generated (PERF_PLAN.md §5.3). Gated on PriorityUser specifically so
+	// this never chains into itself: the prefetch jobs it starts run at
+	// PriorityBackground, which fails this check, so a pan warms one ring of
+	// neighbours, not an ever-expanding flood of them.
+	if prio == PriorityUser {
+		m.prefetchNeighbours(req)
+	}
 	key := req.cacheKey()
 
 	if data, ok := m.memory.Get(key); ok {
 		return data, nil
 	}
-	// Sliced tiles are never stored, so there is nothing on disk to look for.
-	if !req.Sliced {
-		if data, err := m.Store.Get(ctx, req.storeKey(m.Cfg.Format)); err == nil {
-			m.memory.Put(key, data, int64(len(data)))
-			return data, nil
-		} else if !errors.Is(err, cache.ErrNotFound) {
-			m.Log.Warn("tile store read failed", "key", key, "error", err)
-		}
+	sk := req.storeKey(m.Cfg.Format)
+	if data, err := m.Store.Get(ctx, sk); err == nil {
+		m.memory.Put(key, data, int64(len(data)))
+		m.touchSlice(ctx, req, sk)
+		return data, nil
+	} else if !errors.Is(err, cache.ErrNotFound) {
+		m.Log.Warn("tile store read failed", "key", key, "error", err)
 	}
 
 	result, err := m.sched.Submit(ctx, key, prio, func() (any, error) {
@@ -349,19 +389,66 @@ func (m *Manager) Tile(ctx context.Context, req Request, prio Priority) ([]byte,
 	return result.([]byte), nil
 }
 
+// neighbourOffsets are the four tiles sharing an edge with a given tile --
+// the ones a pan in any single direction lands on next.
+var neighbourOffsets = [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
+
+// prefetchNeighbours opportunistically warms the tiles immediately around
+// req at background priority, so a pan in any direction is more likely to
+// land on a tile that is already generated (PERF_PLAN.md §5.3). Fire-and-
+// forget: callers never wait on this, and a neighbour already warm or
+// already being produced for someone else costs nothing extra -- Tile()'s
+// own cache checks and the scheduler's dedup-by-key both short-circuit it.
+func (m *Manager) prefetchNeighbours(req Request) {
+	if req.Pos.Zoom < m.Cfg.MinZoom || req.Pos.Zoom > m.Cfg.MaxZoom {
+		return
+	}
+	for _, d := range neighbourOffsets {
+		nreq := req
+		nreq.Pos.X += d[0]
+		nreq.Pos.Y += d[1]
+		go func(r Request) {
+			// Errors (a full queue, a shut-down manager) are exactly what
+			// background priority exists to absorb silently -- a failed
+			// prefetch just means that neighbour stays cold, same as if it
+			// had never been attempted.
+			_, _ = m.Tile(m.jobCtx, r, PriorityBackground)
+		}(nreq)
+	}
+}
+
+// renderStats collects PERF_PLAN.md §3 (Phase 0) per-stage timings for one
+// tile's cold render, threaded through renderImage/renderDirect/attachVolume
+// and logged by generate. All fields stay zero for a composited tile, whose
+// cost is dominated by fetching children rather than by these stages.
+type renderStats struct {
+	surfaceMs, volumeMs, renderMs, encodeMs float64
+	chunkCount                              int
+	// chunkErrs counts chunks that failed to READ during this render --
+	// never chunks that are merely ungenerated, which are an ordinary
+	// unexplored result and not an error (world.Assemble only reports
+	// non-ErrChunkAbsent failures). A tile rendered over a failed read is
+	// missing real terrain it should have drawn, so generate refuses to
+	// persist it: see storeTile's caller.
+	chunkErrs int
+}
+
 // generate renders, encodes and stores one tile.
 func (m *Manager) generate(ctx context.Context, req Request, depth int) ([]byte, error) {
 	start := time.Now()
+	st := &renderStats{}
 
-	img, err := m.renderImage(ctx, req, depth)
+	img, err := m.renderImage(ctx, req, depth, st)
 	if err != nil {
 		return nil, err
 	}
 
-	u := m.opts.UnexploredColor
+	u := m.blankColor(req.Style)
 	blank := render.IsBlank(img, u.R, u.G, u.B, u.A)
 
+	encStart := time.Now()
 	data, err := m.enc.Encode(img)
+	st.encodeMs = msSince(encStart)
 	if err != nil {
 		return nil, err
 	}
@@ -370,12 +457,21 @@ func (m *Manager) generate(ctx context.Context, req Request, depth int) ([]byte,
 	m.memory.Put(key, data, int64(len(data)))
 	m.images.Put(key, img, int64(len(img.Pix)))
 
-	if !req.Sliced && (!blank || m.Cfg.StoreBlankTiles) {
-		if err := m.Store.Put(ctx, req.storeKey(m.Cfg.Format), data); err != nil {
-			// A storage failure must not fail the request: the tile is rendered
-			// and can still be served, it just will not be cached on disk.
-			m.Log.Error("tile store write failed", "key", key, "error", err)
-		}
+	// A tile whose chunks failed to read is missing terrain that really
+	// exists, and the tile store has no expiry: persisting it would serve
+	// that hole to everyone, forever, with nothing to ever rebuild it (the
+	// server reads from the store, and the generate CLI skips tiles that
+	// already exist). Region files are routinely locked or mid-write while
+	// Minecraft is running, so this is a transient, expected failure -- the
+	// tile is still returned to this caller and memory-cached, it just never
+	// becomes the permanent copy on disk, so the next request re-renders it.
+	if st.chunkErrs > 0 {
+		m.Log.Warn("not persisting a tile rendered with chunk read errors; it will be re-rendered on the next request",
+			"dimension", req.Dimension, "mode", string(req.Mode),
+			"tile_z", req.Pos.Zoom, "tile_x", req.Pos.X, "tile_y", req.Pos.Y,
+			"chunk_errors", st.chunkErrs)
+	} else if !blank || m.Cfg.StoreBlankTiles {
+		m.storeTile(ctx, req, key, data)
 	}
 
 	dur := time.Since(start)
@@ -384,26 +480,81 @@ func (m *Manager) generate(ctx context.Context, req Request, depth int) ([]byte,
 	m.Log.Debug("tile generated",
 		"dimension", req.Dimension, "mode", string(req.Mode), "style", string(req.Style),
 		"tile_z", req.Pos.Zoom, "tile_x", req.Pos.X, "tile_y", req.Pos.Y,
-		"duration_ms", dur.Milliseconds(), "bytes", len(data), "blank", blank, "depth", depth)
+		"duration_ms", dur.Milliseconds(), "bytes", len(data), "blank", blank, "depth", depth,
+		"surface_ms", st.surfaceMs, "volume_ms", st.volumeMs,
+		"render_ms", st.renderMs, "encode_ms", st.encodeMs, "chunks", st.chunkCount)
 
 	return data, nil
 }
 
+// msSince returns the elapsed time since start in fractional milliseconds,
+// precise enough for stage timings well under a millisecond.
+func msSince(start time.Time) float64 { return float64(time.Since(start)) / float64(time.Millisecond) }
+
+// storeTile persists a rendered tile's bytes to the store, and -- for a
+// sliced request -- records the write with sliceVariants so a level that
+// stops being visited is eventually evicted rather than accumulating forever
+// (PERF_PLAN.md §5.1). logKey is only for the failure log line, so the
+// caller's own cacheKey() need not be recomputed here.
+func (m *Manager) storeTile(ctx context.Context, req Request, logKey string, data []byte) {
+	sk := req.storeKey(m.Cfg.Format)
+	if err := m.Store.Put(ctx, sk, data); err != nil {
+		// A storage failure must not fail the request: the tile is rendered
+		// and can still be served, it just will not be cached on disk.
+		m.Log.Error("tile store write failed", "key", logKey, "error", err)
+		return
+	}
+	m.touchSlice(ctx, req, sk)
+}
+
+// touchSlice marks a sliced request's level most-recently-used, whether the
+// tile was just written or served from an existing store hit -- a level
+// visited only through cache hits, never rewritten, must not look cold to
+// the LRU and get evicted out from under active use. A no-op for an unsliced
+// request.
+func (m *Manager) touchSlice(ctx context.Context, req Request, sk cache.Key) {
+	if !req.Sliced {
+		return
+	}
+	fam := sliceFamily{dimension: req.Dimension, mode: string(req.Mode), camera: req.Camera.String()}
+	m.slices.touch(ctx, m.Store, m.Log, fam, req.SliceY, sk)
+}
+
 // renderImage produces a tile image, either directly from world data or by
 // compositing four children.
-func (m *Manager) renderImage(ctx context.Context, req Request, depth int) (*image.NRGBA, error) {
+func (m *Manager) renderImage(ctx context.Context, req Request, depth int, st *renderStats) (*image.NRGBA, error) {
 	dim, ok := m.Provider.Dimension(ctx, req.Dimension)
 	if !ok {
 		return nil, fmt.Errorf("unknown dimension %q", req.Dimension)
 	}
 	if m.canRenderDirect(req.Mode, req.Pos.Zoom) {
-		return m.renderDirect(ctx, req, dim)
+		return m.renderDirect(ctx, req, dim, st)
 	}
-	return m.renderComposite(ctx, req, depth)
+	return m.renderComposite(ctx, req, depth, st)
+}
+
+// isoWindow returns the Y range to assemble a tile's surface over: the
+// dimension's learned band (PERF_PLAN.md §4.1) tightened to a slice's ceiling
+// when one is active (§4.3 -- the surface window and the volume window must
+// agree, since everything visible under a slice sits at or below the cut),
+// falling back to the dimension's full range when nothing has been observed
+// yet.
+func (m *Manager) isoWindow(ctx context.Context, req Request, dim world.DimensionInfo) (lo, hi int) {
+	lo, hi = dim.MinY, dim.MaxY
+	if ol, oh, ok := m.heightBand(ctx, req.Dimension).window(dim.MinY, dim.MaxY); ok {
+		lo, hi = ol, oh
+	}
+	if req.Sliced && req.SliceY < hi {
+		hi = req.SliceY
+	}
+	if hi < lo {
+		hi = lo
+	}
+	return lo, hi
 }
 
 // renderDirect renders a tile from world data.
-func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.DimensionInfo) (*image.NRGBA, error) {
+func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.DimensionInfo, st *renderStats) (*image.NRGBA, error) {
 	sh := m.shader(req.Style, dim)
 
 	var bounds mcmath.BlockBounds
@@ -411,12 +562,14 @@ func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.Dimen
 	if req.Mode == ModeIso {
 		iso = render.NewIso(sh, req.Camera, m.Cfg.IsoEdgeSkirt)
 		iso.Sliced, iso.SliceY = req.Sliced, req.SliceY
-		bounds = iso.SurfaceBounds(req.Pos, dim.MinY, dim.MaxY)
+		lo, hi := m.isoWindow(ctx, req, dim)
+		bounds = iso.SurfaceBounds(req.Pos, lo, hi)
 	} else {
 		td := render.NewTopDown(sh)
 		bounds = td.SurfaceBounds(req.Pos)
 	}
 
+	surfStart := time.Now()
 	var chunkErrs int
 	surf, err := world.Assemble(ctx, m.Provider, req.Dimension, bounds, dim.MinY, dim.MaxY,
 		func(pos mcmath.ChunkPos, err error) {
@@ -430,6 +583,12 @@ func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.Dimen
 	if err != nil {
 		return nil, err
 	}
+	if st != nil {
+		st.surfaceMs = msSince(surfStart)
+		minCX, minCZ, maxCX, maxCZ := bounds.ChunkRange()
+		st.chunkCount = (maxCX - minCX) * (maxCZ - minCZ)
+		st.chunkErrs += chunkErrs
+	}
 	if chunkErrs > 0 {
 		m.Log.Warn("tile rendered with chunk errors",
 			"dimension", req.Dimension, "tile_z", req.Pos.Zoom,
@@ -438,10 +597,16 @@ func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.Dimen
 
 	// An entirely unexplored window needs no renderer at all.
 	if !surf.AnyPresent() {
-		return render.FillUnexplored(m.opts.UnexploredColor), nil
+		return render.FillUnexplored(m.blankColor(req.Style)), nil
 	}
 
 	if req.Mode == ModeIso {
+		// Feed this render's actual terrain extent back into the dimension's
+		// learned band (PERF_PLAN.md §4.1) so later tiles -- anywhere in the
+		// dimension -- can assemble a narrower window than the full range.
+		if lo, hi, ok := surf.HeightRange(); ok {
+			m.observeHeightRange(ctx, req.Dimension, lo, hi)
+		}
 		switch {
 		case !m.Cfg.IsoVoxel:
 			// Feature disabled: iso.Volume stays nil, byte-identical to
@@ -451,15 +616,30 @@ func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.Dimen
 				m.Log.Info("render.isoVoxel is enabled but the active world provider does not support voxel data; using the heightmap iso renderer")
 			}
 		default:
-			if verr := m.attachVolume(ctx, req, dim, iso, surf); verr != nil {
+			volStart := time.Now()
+			verr := m.attachVolume(ctx, req, dim, iso, surf, st)
+			if st != nil {
+				st.volumeMs = msSince(volStart)
+			}
+			if verr != nil {
 				m.Log.Warn("voxel volume assembly failed, falling back to the heightmap iso renderer",
 					"dimension", req.Dimension, "tile_z", req.Pos.Zoom,
 					"tile_x", req.Pos.X, "tile_y", req.Pos.Y, "error", verr)
 			}
 		}
-		return iso.Render(req.Pos, surf), nil
+		renderStart := time.Now()
+		img := iso.Render(req.Pos, surf)
+		if st != nil {
+			st.renderMs = msSince(renderStart)
+		}
+		return img, nil
 	}
-	return render.NewTopDown(sh).Render(req.Pos, surf), nil
+	renderStart := time.Now()
+	img := render.NewTopDown(sh).Render(req.Pos, surf)
+	if st != nil {
+		st.renderMs = msSince(renderStart)
+	}
+	return img, nil
 }
 
 // attachVolume implements ISO_VOXEL_PLAN.md §4.5's mandatory window
@@ -469,15 +649,17 @@ func (m *Manager) renderDirect(ctx context.Context, req Request, dim world.Dimen
 // is recomputed tightly from the surface's own actual height range: for
 // terrain confined to a narrow band of a tall dimension, this is a 4x+
 // reduction in columns visited versus using the dimension's full MinY..MaxY.
-func (m *Manager) attachVolume(ctx context.Context, req Request, dim world.DimensionInfo, iso *render.Iso, surf *world.Surface) error {
+func (m *Manager) attachVolume(ctx context.Context, req Request, dim world.DimensionInfo, iso *render.Iso, surf *world.Surface, st *renderStats) error {
 	lo, hi, ok := surf.HeightRange()
 	if !ok {
 		return nil // AnyPresent() was already checked by the caller; unreachable in practice
 	}
-	// Subtracting IsoVoxelMaxDepth covers the deepest a per-chunk slab could
-	// ever reach, so the basement skirt fallback never has to activate for
-	// terrain still within the tightened window.
-	loEff := lo - m.Cfg.IsoVoxelMaxDepth
+	// Subtracting the dimension's observed max slab depth (PERF_PLAN.md §4.2)
+	// covers the deepest a per-chunk slab has actually been seen to reach, so
+	// the basement skirt fallback never has to activate for terrain still
+	// within the tightened window. IsoVoxelMaxDepth remains the ceiling until
+	// enough of the dimension has been rendered to learn a tighter real value.
+	loEff := lo - m.heightBand(ctx, req.Dimension).slabDepth(m.Cfg.IsoVoxelMaxDepth)
 	hiEff := hi
 	// Under a Y slice the band stops at the cut. Elevation is what makes the
 	// isometric footprint wide -- every Y level shifts terrain another block
@@ -508,11 +690,18 @@ func (m *Manager) attachVolume(ctx context.Context, req Request, dim world.Dimen
 		return err
 	}
 	if chunkErrs > 0 {
+		// Counted the same as a surface read failure: a voxel slab that
+		// failed to load leaves real geometry undrawn, which must not become
+		// the permanent stored copy of this tile either.
+		if st != nil {
+			st.chunkErrs += chunkErrs
+		}
 		m.Log.Warn("tile's voxel volume assembled with chunk errors",
 			"dimension", req.Dimension, "tile_z", req.Pos.Zoom,
 			"tile_x", req.Pos.X, "tile_y", req.Pos.Y, "chunk_errors", chunkErrs)
 	}
 	iso.Volume = vol
+	m.observeSlabDepth(ctx, req.Dimension, vol.MaxChunkDepth())
 	return nil
 }
 
@@ -522,7 +711,10 @@ func (m *Manager) attachVolume(ctx context.Context, req Request, dim world.Dimen
 // bounded by MaxCompositeDepth so a single request cannot cascade into an
 // unbounded amount of work; beyond that depth a missing child is treated as
 // unexplored and the tile is completed by the pre-generation sweep later.
-func (m *Manager) renderComposite(ctx context.Context, req Request, depth int) (*image.NRGBA, error) {
+// st, when set, accumulates the children's chunk read errors, so a parent
+// built from an incomplete child is recognised as incomplete itself rather
+// than being persisted as the permanent copy of that area.
+func (m *Manager) renderComposite(ctx context.Context, req Request, depth int, st *renderStats) (*image.NRGBA, error) {
 	var children [4]*image.NRGBA
 	var blanks [4]bool
 
@@ -533,7 +725,7 @@ func (m *Manager) renderComposite(ctx context.Context, req Request, depth int) (
 		childReq := req
 		childReq.Pos = cp
 
-		img, err := m.childImage(ctx, childReq, depth)
+		img, err := m.childImage(ctx, childReq, depth, st)
 		if err != nil {
 			if !errors.Is(err, errTooDeep) {
 				m.Log.Warn("child tile unavailable",
@@ -545,61 +737,71 @@ func (m *Manager) renderComposite(ctx context.Context, req Request, depth int) (
 		children[i] = img
 	}
 
-	fill := render.FillUnexplored(m.opts.UnexploredColor)
+	fill := render.FillUnexplored(m.blankColor(req.Style))
 	return render.Composite(children, blanks, fill), nil
 }
 
 var errTooDeep = errors.New("composite depth limit reached")
 
-// childImage fetches or renders one child tile as a decoded image.
-func (m *Manager) childImage(ctx context.Context, req Request, depth int) (*image.NRGBA, error) {
+// childImage fetches or renders one child tile as a decoded image. parentStats,
+// when set, receives any chunk read errors this child hit, so an incomplete
+// child makes its parent incomplete too.
+func (m *Manager) childImage(ctx context.Context, req Request, depth int, parentStats *renderStats) (*image.NRGBA, error) {
 	key := req.cacheKey()
 	if img, ok := m.images.Get(key); ok {
 		return img, nil
 	}
-	// The store is keyed without the slice level, so for a sliced request it
-	// must be bypassed in both directions: reading would return the whole-world
-	// tile and silently undo the slice, and writing would file a cut-away image
-	// under the unsliced key and corrupt the stored pyramid for everyone.
-	if !req.Sliced {
-		if data, err := m.Store.Get(ctx, req.storeKey(m.Cfg.Format)); err == nil {
-			img, derr := decodeTile(data)
-			if derr == nil {
-				m.images.Put(key, img, int64(len(img.Pix)))
-				return img, nil
-			}
-			m.Log.Warn("stored tile failed to decode, regenerating", "key", key, "error", derr)
-		} else if !errors.Is(err, cache.ErrNotFound) {
-			return nil, err
+	// The store key folds in the slice level (Request.variant()), so a
+	// sliced child tile of one level can never be confused for another's or
+	// for the unsliced tile -- same read/write path as any other variant.
+	sk := req.storeKey(m.Cfg.Format)
+	if data, err := m.Store.Get(ctx, sk); err == nil {
+		img, derr := decodeTile(data)
+		if derr == nil {
+			m.images.Put(key, img, int64(len(img.Pix)))
+			m.touchSlice(ctx, req, sk)
+			return img, nil
 		}
+		m.Log.Warn("stored tile failed to decode, regenerating", "key", key, "error", derr)
+	} else if !errors.Is(err, cache.ErrNotFound) {
+		return nil, err
 	}
 
 	if depth+1 > m.Cfg.MaxCompositeDepth {
 		return nil, errTooDeep
 	}
 
-	img, err := m.renderImage(ctx, req, depth+1)
+	// A child gets its own stats purely to learn whether its chunks read
+	// cleanly; a child rendered over a failed read must not be persisted
+	// either, for exactly the reason generate gives.
+	childStats := &renderStats{}
+	img, err := m.renderImage(ctx, req, depth+1, childStats)
 	if err != nil {
 		return nil, err
 	}
+	if parentStats != nil {
+		parentStats.chunkErrs += childStats.chunkErrs
+	}
 	// Persist the freshly rendered child so sibling parents and later requests
-	// do not repeat the work. Sliced children are memory-only, for the same
-	// reason sliced tiles are: one variant per level would multiply the stored
-	// pyramid, and the store key cannot tell them apart anyway.
-	u := m.opts.UnexploredColor
-	if !render.IsBlank(img, u.R, u.G, u.B, u.A) || m.Cfg.StoreBlankTiles {
+	// do not repeat the work -- sliced children included (PERF_PLAN.md §5.1).
+	u := m.blankColor(req.Style)
+	storable := childStats.chunkErrs == 0
+	if storable && (!render.IsBlank(img, u.R, u.G, u.B, u.A) || m.Cfg.StoreBlankTiles) {
 		if data, encErr := m.enc.Encode(img); encErr == nil {
-			if !req.Sliced {
-				if perr := m.Store.Put(ctx, req.storeKey(m.Cfg.Format), data); perr != nil {
-					m.Log.Error("child tile store write failed", "key", key, "error", perr)
-				}
-			}
+			m.storeTile(ctx, req, key, data)
 			m.memory.Put(key, data, int64(len(data)))
 		}
 	}
 	m.images.Put(key, img, int64(len(img.Pix)))
 	m.generated.Add(1)
 	return img, nil
+}
+
+func (m *Manager) blankColor(style render.Style) color.NRGBA {
+	if style == render.StyleContour {
+		return color.NRGBA{}
+	}
+	return m.opts.UnexploredColor
 }
 
 // decodeTile decodes stored tile bytes back into an editable image.

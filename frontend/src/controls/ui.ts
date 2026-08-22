@@ -502,10 +502,18 @@ export interface LayerToggleDef {
   onToggle(): void;
 }
 
+/** One selectable terrain render style, as offered by the server's config. */
+export interface StyleDef {
+  id: string;
+  name: string;
+  hint: string;
+}
+
 export class LayersPopover {
   readonly root: HTMLElement;
   private readonly grid: HTMLElement;
   private readonly toggles: Array<{ def: LayerToggleDef; button: HTMLButtonElement; dot: HTMLElement }> = [];
+  private readonly styleButtons: Array<{ id: string; button: HTMLButtonElement }> = [];
 
   /**
    * `boundary` must contain both this popover's panel and whatever button
@@ -537,6 +545,47 @@ export class LayersPopover {
     this.refresh();
 
     closeOnOutside(boundary, () => !this.root.hidden, () => this.setVisible(false));
+  }
+
+  /**
+   * Adds the render-style selector below the overlay toggles.
+   *
+   * Styles are a different kind of control from the toggles above -- they are
+   * mutually exclusive and they repaint the terrain itself rather than adding
+   * something on top of it -- so they get their own labelled section and a
+   * radio-like appearance instead of being mixed into the toggle grid.
+   *
+   * Called separately from the constructor because the style list comes from
+   * the server's config, which the popover itself has no business knowing
+   * about.
+   */
+  setStyles(styles: StyleDef[], current: string, onPick: (style: string) => void): void {
+    if (styles.length < 2) return; // nothing to choose between
+    this.root.appendChild(el('div', 'mm-layers-title mm-layers-title-sub', 'TERRAIN STYLE'));
+    const grid = el('div', 'mm-layers-grid');
+    this.root.appendChild(grid);
+
+    for (const s of styles) {
+      const button = el('button', 'mm-layers-toggle');
+      button.type = 'button';
+      const dot = el('span', 'mm-layers-dot');
+      button.append(dot, el('span', undefined, s.name));
+      button.title = s.hint;
+      button.addEventListener('click', () => {
+        onPick(s.id);
+        this.refreshStyles(s.id);
+      });
+      grid.appendChild(button);
+      this.styleButtons.push({ id: s.id, button });
+    }
+    this.refreshStyles(current);
+  }
+
+  /** Marks the active style, leaving the overlay toggles alone. */
+  refreshStyles(current: string): void {
+    for (const { id, button } of this.styleButtons) {
+      button.classList.toggle('is-on', id === current);
+    }
   }
 
   setVisible(v: boolean): void {

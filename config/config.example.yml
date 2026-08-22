@@ -77,8 +77,15 @@ tiles:
   pregenerate: false
   pregenerateMaxZoom: 6
 
-  styles: ["terrain"]        # terrain, biome, height
+  styles: ["terrain"]        # terrain, biome, height, light, ore
   modes: ["top", "iso"]
+
+  # How many distinct Y-slice levels' tiles stay on disk per dimension/mode/
+  # camera before the least-recently-used one is evicted. Each level is a
+  # full tile pyramid, so this bounds how much the slice control can grow
+  # storage by, at the cost of re-rendering a level that falls out of the
+  # window if it's revisited later.
+  maxSliceVariants: 12
 
 map:
   minZoom: 0
@@ -126,6 +133,13 @@ render:
   # because it makes unlit terrain darker than most people expect.
   lightShading: false
   unexploredColor: "#14161a"
+  # Enable transparent elevation contour tiles for the optional client-side
+  # contour overlay.
+  contour: false
+  contourInterval: 8
+  contourMajorEvery: 4
+  contourColor: "#4a33209b"
+  contourMajorColor: "#6b4828e6"
   # Isometric camera corner: se, sw, nw or ne. Only se is rendered today.
   isoCamera: "se"
   isoEdgeSkirt: 4
@@ -142,6 +156,11 @@ render:
   isoVoxelMinDepth: 8
   # Hard cap on per-chunk voxel slab depth, regardless of canopy height.
   isoVoxelMaxDepth: 64
+
+  # Summarise each column's ore content so the "ore" render style has data to
+  # draw. Costs one extra full-depth walk per column the first time each chunk
+  # is decoded; with this off the ore style renders empty.
+  oreScan: false
 
 data:
   blocksFile: "./blocks.json"

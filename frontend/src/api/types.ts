@@ -52,6 +52,7 @@ export interface ClientConfig {
   defaultStyle: string;
   modes: string[];
   styles: string[];
+  contourEnabled: boolean;
   overlays: OverlayThresholds;
   isoCamera: string;
   iso: IsoClientConfig;

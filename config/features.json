@@ -1,0 +1,76 @@
+{
+  "players": [
+    {
+      "uuid": "5e45ce71-3cfa-4f6a-a5a3-66d2486c508e",
+      "name": "Daniel",
+      "dimension": "minecraft:overworld",
+      "x": 24,
+      "z": 184,
+      "y": 70,
+      "rotation": 45,
+      "health": 20,
+      "armor": 14
+    },
+    {
+      "uuid": "069a79f4-44e9-4726-a5be-fca90e38aaf5",
+      "name": "Notch",
+      "dimension": "minecraft:overworld",
+      "x": -20,
+      "z": 200,
+      "y": 68,
+      "rotation": 200,
+      "health": 18,
+      "armor": 10
+    },
+    {
+      "uuid": "853c80ef-3c37-49fd-aa49-938b674adae6",
+      "name": "jeb_",
+      "dimension": "minecraft:overworld",
+      "x": 60,
+      "z": 140,
+      "y": 72,
+      "rotation": 300,
+      "health": 20,
+      "armor": 0
+    }
+  ],
+  "areas": [
+    {
+      "id": "claim-daniel-spawn",
+      "kind": "claim",
+      "name": "Daniel's Claim",
+      "owner": "Daniel",
+      "dimension": "minecraft:overworld",
+      "shape": "chunks",
+      "chunks": [
+        { "x": 0, "z": 10 }, { "x": 1, "z": 10 }, { "x": 2, "z": 10 },
+        { "x": 0, "z": 11 }, { "x": 1, "z": 11 }, { "x": 2, "z": 11 },
+        { "x": 0, "z": 12 }, { "x": 1, "z": 12 }, { "x": 2, "z": 12 }
+      ]
+    },
+    {
+      "id": "claim-notch-west",
+      "kind": "claim",
+      "name": "Notch's Claim",
+      "owner": "Notch",
+      "dimension": "minecraft:overworld",
+      "shape": "chunks",
+      "chunks": [
+        { "x": -2, "z": 11 }, { "x": -1, "z": 11 },
+        { "x": -2, "z": 12 }, { "x": -1, "z": 12 }
+      ]
+    },
+    {
+      "id": "claim-jeb-east",
+      "kind": "claim",
+      "name": "jeb_'s Claim",
+      "owner": "jeb_",
+      "dimension": "minecraft:overworld",
+      "shape": "chunks",
+      "chunks": [
+        { "x": 3, "z": 8 }, { "x": 4, "z": 8 },
+        { "x": 3, "z": 9 }, { "x": 4, "z": 9 }
+      ]
+    }
+  ]
+}

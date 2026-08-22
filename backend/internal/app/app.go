@@ -114,6 +114,7 @@ func Build(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, erro
 			Biomes:           bio,
 			ExtraDimensions:  cfg.Minecraft.ExtraDimensionPaths,
 			RegionCacheFiles: cfg.Minecraft.RegionCacheFiles,
+			ScanOres:         cfg.Render.OreScan,
 			VoxelDepth: mcworld.VoxelDepthConfig{
 				BelowGround: cfg.Render.IsoVoxelBelowGround,
 				MinDepth:    cfg.Render.IsoVoxelMinDepth,
@@ -159,6 +160,7 @@ func Build(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, erro
 			IsoEdgeSkirt:      cfg.Render.IsoEdgeSkirt,
 			IsoVoxel:          cfg.Render.IsoVoxel,
 			IsoVoxelMaxDepth:  cfg.Render.IsoVoxelMaxDepth,
+			MaxSliceVariants:  cfg.Tiles.MaxSliceVariants,
 		},
 		cfg.Tiles.Workers, cfg.Tiles.MaxQueued, log,
 	)

@@ -63,6 +63,18 @@ type ChunkSurface struct {
 	// Light is the stored block/sky light at the surface, 0..15. Worlds without
 	// light data report 15.
 	Light [ColumnCount]uint8
+	// BlockLight is torch/lava/glowstone light only, with sky light excluded,
+	// sampled in the air just above the surface. StyleLight uses this rather
+	// than Light because only this answers "can a hostile mob spawn here
+	// after dark"; worlds without light data report 0.
+	BlockLight [ColumnCount]uint8
+	// OreBest is the most valuable OreKind anywhere in the column, and
+	// OreScore a rarity-weighted total of everything in it (see OrePoints),
+	// saturating at 255. Both are zero unless the world reader was built with
+	// ore scanning enabled, since filling them costs a full-column walk that
+	// the ordinary surface scan does not otherwise need.
+	OreBest  [ColumnCount]uint8
+	OreScore [ColumnCount]uint8
 	// Flags carries the FlagPresent family.
 	Flags [ColumnCount]uint8
 }
@@ -84,6 +96,9 @@ func (c *ChunkSurface) At(x, z int) Column {
 		Decoration: c.Decoration[i],
 		Biome:      c.Biome[i],
 		Light:      c.Light[i],
+		BlockLight: c.BlockLight[i],
+		OreBest:    OreKind(c.OreBest[i]),
+		OreScore:   c.OreScore[i],
 		Flags:      c.Flags[i],
 	}
 }
@@ -101,6 +116,9 @@ type Column struct {
 	Decoration uint16
 	Biome      uint16
 	Light      uint8
+	BlockLight uint8
+	OreBest    OreKind
+	OreScore   uint8
 	Flags      uint8
 }
 
@@ -150,6 +168,9 @@ type Surface struct {
 	decoration []uint16
 	biome      []uint16
 	light      []uint8
+	blockLight []uint8
+	oreBest    []uint8
+	oreScore   []uint8
 	flags      []uint8
 
 	// MinY and MaxY carry the dimension's height range so renderers and the
@@ -171,6 +192,9 @@ func NewSurface(b mcmath.BlockBounds, minY, maxY int) *Surface {
 		decoration: make([]uint16, n),
 		biome:      make([]uint16, n),
 		light:      make([]uint8, n),
+		blockLight: make([]uint8, n),
+		oreBest:    make([]uint8, n),
+		oreScore:   make([]uint8, n),
 		flags:      make([]uint8, n),
 		MinY:       minY,
 		MaxY:       maxY,
@@ -199,6 +223,9 @@ func (s *Surface) At(x, z int) Column {
 		Decoration: s.decoration[i],
 		Biome:      s.biome[i],
 		Light:      s.light[i],
+		BlockLight: s.blockLight[i],
+		OreBest:    OreKind(s.oreBest[i]),
+		OreScore:   s.oreScore[i],
 		Flags:      s.flags[i],
 	}
 }
@@ -235,6 +262,9 @@ func (s *Surface) Set(x, z int, c Column) {
 	s.decoration[i] = c.Decoration
 	s.biome[i] = c.Biome
 	s.light[i] = c.Light
+	s.blockLight[i] = c.BlockLight
+	s.oreBest[i] = uint8(c.OreBest)
+	s.oreScore[i] = c.OreScore
 	s.flags[i] = c.Flags
 }
 
@@ -259,6 +289,9 @@ func (s *Surface) Blit(cs *ChunkSurface) {
 			s.decoration[d] = cs.Decoration[sIdx]
 			s.biome[d] = cs.Biome[sIdx]
 			s.light[d] = cs.Light[sIdx]
+			s.blockLight[d] = cs.BlockLight[sIdx]
+			s.oreBest[d] = cs.OreBest[sIdx]
+			s.oreScore[d] = cs.OreScore[sIdx]
 			s.flags[d] = cs.Flags[sIdx]
 		}
 	}

@@ -113,12 +113,15 @@ func (r *TopDown) renderAveraged(img *image.NRGBA, b mcmath.BlockBounds, n int, 
 		n = 1
 	}
 	unexplored := r.Shader.Opts.UnexploredColor
+	if r.Shader.Style == StyleContour {
+		unexplored = color.NRGBA{}
+	}
 	for py := 0; py < mcmath.TileSize; py++ {
 		z0 := b.MinZ + py*n
 		row := img.PixOffset(0, py)
 		for px := 0; px < mcmath.TileSize; px++ {
 			x0 := b.MinX + px*n
-			var sr, sg, sb, count uint32
+			var sr, sg, sb, sa, count uint32
 			for dz := 0; dz < n; dz++ {
 				for dx := 0; dx < n; dx++ {
 					c, ok := r.Shader.ColumnColor(surf, x0+dx, z0+dz)
@@ -128,6 +131,7 @@ func (r *TopDown) renderAveraged(img *image.NRGBA, b mcmath.BlockBounds, n int, 
 					sr += uint32(c.R)
 					sg += uint32(c.G)
 					sb += uint32(c.B)
+					sa += uint32(c.A)
 					count++
 				}
 			}
@@ -142,6 +146,10 @@ func (r *TopDown) renderAveraged(img *image.NRGBA, b mcmath.BlockBounds, n int, 
 			img.Pix[o+0] = uint8(sr / count)
 			img.Pix[o+1] = uint8(sg / count)
 			img.Pix[o+2] = uint8(sb / count)
+			if r.Shader.Style == StyleContour {
+				img.Pix[o+3] = uint8(sa / count)
+				continue
+			}
 			// Partially-explored pixels stay fully opaque; coverage is conveyed
 			// by the terrain itself, not by transparency.
 			img.Pix[o+3] = 255

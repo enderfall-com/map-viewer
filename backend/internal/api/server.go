@@ -397,6 +397,7 @@ type ClientConfig struct {
 	DefaultStyle     string                `json:"defaultStyle"`
 	Modes            []string              `json:"modes"`
 	Styles           []string              `json:"styles"`
+	ContourEnabled   bool                  `json:"contourEnabled"`
 	Overlays         config.Overlays       `json:"overlays"`
 	IsoCamera        string                `json:"isoCamera"`
 	Iso              IsoClientConfig       `json:"iso"`
@@ -442,6 +443,7 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 		DefaultStyle:     s.Cfg.Map.DefaultStyle,
 		Modes:            s.Cfg.Tiles.Modes,
 		Styles:           s.Cfg.Tiles.Styles,
+		ContourEnabled:   s.Cfg.Render.Contour,
 		Overlays:         s.Cfg.Overlays,
 		IsoCamera:        s.Cfg.Render.IsoCamera,
 		Iso: IsoClientConfig{

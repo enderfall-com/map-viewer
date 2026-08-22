@@ -68,6 +68,16 @@ type Iso struct {
 	// single surface height per column and nothing about what is underneath,
 	// so there is nothing there to reveal.
 	SliceY int
+
+	// occludesCache memoizes voxelOccludesCol's block-id lookups (both
+	// Shader.HasTexture and Blocks.Get(id).Occludes take a lock over their
+	// respective maps) for the lifetime of one tile render, since a tile
+	// touches only a few dozen distinct block ids but checks occlusion for
+	// every voxel face -- often millions of times (PERF_PLAN.md §6). Lazily
+	// allocated by the voxel path only, so the heightmap path never pays for
+	// it. Safe because one Iso is built fresh per tile render and never
+	// shared across goroutines.
+	occludesCache map[uint16]bool
 }
 
 // NewIso builds an isometric renderer for a camera direction. edgeSkirt <= 0
@@ -114,7 +124,11 @@ func (r *Iso) Render(pos mcmath.TilePos, surf *world.Surface) *image.NRGBA {
 		return r.renderVoxel(pos, surf)
 	}
 
-	img := FillUnexplored(r.Shader.Opts.UnexploredColor)
+	fill := r.Shader.Opts.UnexploredColor
+	if r.Shader.Style == StyleContour {
+		fill = color.NRGBA{}
+	}
+	img := FillUnexplored(fill)
 
 	ppu := int(mcmath.PixelsPerBlock(pos.Zoom)) // pixels per iso unit
 	if pos.Zoom < MinDirectZoom || ppu < 2 {

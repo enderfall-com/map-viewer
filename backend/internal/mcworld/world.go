@@ -35,7 +35,12 @@ type Options struct {
 	// VoxelDepth bounds how many Y layers of voxel data ChunkVoxels stores
 	// per chunk. The zero value resolves to DefaultVoxelDepthConfig().
 	VoxelDepth VoxelDepthConfig
-	Log        *slog.Logger
+	// ScanOres makes the chunk scanner summarise each column's ore content
+	// for the ore-heatmap render style. It costs an extra full-depth walk per
+	// column on first decode of every chunk, so it is opt-in: leave it false
+	// and the ore style simply renders empty.
+	ScanOres bool
+	Log      *slog.Logger
 }
 
 // World reads chunk surfaces from Anvil region files.
@@ -55,6 +60,7 @@ type World struct {
 	byID map[string]world.DimensionInfo
 
 	voxelDepth VoxelDepthConfig
+	scanOres   bool
 
 	regions *cache.LRU[regionKey, *anvil.Region]
 	// regionFlight stops several workers opening the same region file at once.
@@ -103,6 +109,7 @@ func Open(opts Options) (*World, error) {
 		log:          opts.Log,
 		waterID:      opts.Blocks.ID("minecraft:water"),
 		voxelDepth:   voxelDepth.clamp(),
+		scanOres:     opts.ScanOres,
 		regions:      cache.NewLRU[regionKey, *anvil.Region](int64(opts.RegionCacheFiles)),
 		regionFlight: cache.NewGroup[regionKey, *anvil.Region](),
 		watch:        make(map[regionKey]*regionWatch),

@@ -188,6 +188,65 @@ func (v *Volume) Depth(x, z int) int {
 	return cv.Depth
 }
 
+// ColumnVoxels is a resolved accessor for one (x,z) column's voxel data
+// within a Volume. BlockAt/TopY/Depth each re-run chunkAt's coordinate math
+// and chunk-pointer lookup on every call; a caller reading many Y levels of
+// the *same* column -- the voxel renderer's per-column loop, or a ray march's
+// per-column occlusion scan -- does that lookup once via Volume.ColumnAt and
+// reuses it (PERF_PLAN.md §6: "reuse the chunk pointer per column"). The zero
+// value behaves exactly like an unloaded column, matching chunkAt's nil case.
+type ColumnVoxels struct {
+	cv  *ChunkVoxels
+	col int
+}
+
+// ColumnAt resolves a world (x,z) to a reusable column accessor.
+func (v *Volume) ColumnAt(x, z int) ColumnVoxels {
+	cv := v.chunkAt(x, z)
+	if cv == nil {
+		return ColumnVoxels{}
+	}
+	return ColumnVoxels{cv: cv, col: Index(x, z)}
+}
+
+// At mirrors Volume.BlockAt for this column.
+func (c ColumnVoxels) At(y int) (id uint16, light uint8, ok bool) {
+	if c.cv == nil {
+		return 0, 0, false
+	}
+	return c.cv.At(c.col, y)
+}
+
+// TopY mirrors Volume.TopY for this column.
+func (c ColumnVoxels) TopY() (int, bool) {
+	if c.cv == nil {
+		return 0, false
+	}
+	return int(c.cv.TopY[c.col]), true
+}
+
+// Depth mirrors Volume.Depth for this column.
+func (c ColumnVoxels) Depth() int {
+	if c.cv == nil {
+		return 0
+	}
+	return c.cv.Depth
+}
+
+// MaxChunkDepth returns the largest per-chunk slab depth actually loaded into
+// this volume, or 0 if it holds no chunks. Callers use this to learn the real
+// slab depth a dimension needs (PERF_PLAN.md §4.2), instead of always padding
+// for the worst case a chunk could ever produce.
+func (v *Volume) MaxChunkDepth() int {
+	max := 0
+	for _, cv := range v.chunks {
+		if cv != nil && cv.Depth > max {
+			max = cv.Depth
+		}
+	}
+	return max
+}
+
 // ---------------------------------------------------------------------------
 // VolumeProvider
 // ---------------------------------------------------------------------------
@@ -361,8 +420,9 @@ func VoxelRayMarch(p mcmath.IsoProjection, u, v float64, minY, maxY int, vol *Vo
 // (ISO_VOXEL_PLAN.md §4.5) and may simply not reach this deep for this
 // column, which is not the same thing as "definitely empty here".
 func highestOccluding(vol *Volume, x, z, loY, hiY int, occludes func(id uint16) bool) (int, bool) {
+	col := vol.ColumnAt(x, z)
 	for y := hiY; y >= loY; y-- {
-		id, _, ok := vol.BlockAt(x, y, z)
+		id, _, ok := col.At(y)
 		if !ok || id == 0 {
 			continue
 		}

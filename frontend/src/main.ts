@@ -51,18 +51,17 @@ import {
 const MAX_DRAG_CHUNKS = 12;
 const MAX_CHUNK_SELECTION = MAX_DRAG_CHUNKS * MAX_DRAG_CHUNKS;
 
-/** Minimum zoom when jumping to a followed player -- close enough to
+/** Minimum zoom when jumping to a clicked player -- close enough to
  * actually make out their model, not just land somewhere in view. */
 const FOLLOW_ZOOM = 8;
 
-/** Y levels between adjacent positions of the slice slider, and how long the
- * drag must settle before the slice is applied. Both exist because a sliced
- * isometric tile is rendered from voxel data on demand rather than served from
- * the stored pyramid: coarse steps keep the number of distinct variants small,
- * and the delay means one drag costs one render pass instead of one per
- * intermediate level. */
+/** Y levels between adjacent positions of the slice slider. A sliced
+ * isometric tile is rendered from voxel data on demand rather than served
+ * from the stored pyramid, so coarse steps keep the number of distinct
+ * variants a drag could visit small; the render itself is applied on release
+ * (the "change" event), not while dragging, so one drag costs one render pass
+ * rather than one per intermediate level. */
 const SLICE_STEP = 4;
-const SLICE_DEBOUNCE_MS = 250;
 
 /** True when none of Ctrl/Cmd/Alt are held, so a bare-letter shortcut never
  * fights a browser or OS combination that happens to share the same key
@@ -231,6 +230,7 @@ async function boot(): Promise<void> {
     regions: true,
     markers: true,
     forceLoaded: true,
+    contours: false,
     chunkGrid: false,
     blockGrid: false,
     worldBorder: false,
@@ -258,6 +258,15 @@ async function boot(): Promise<void> {
       overlayState.forceLoaded = !overlayState.forceLoaded;
       features.setForceLoadedVisible(overlayState.forceLoaded);
     } },
+    ...(config.contourEnabled ? [{
+      key: 'contours' as const,
+      name: 'Contours',
+      isOn: () => overlayState.contours,
+      onToggle: () => {
+        overlayState.contours = !overlayState.contours;
+        engine.setContours(overlayState.contours);
+      },
+    }] : []),
     { key: 'chunkGrid', name: 'Chunk grid', isOn: () => overlayState.chunkGrid, onToggle: () => setChunkGrid(!overlayState.chunkGrid) },
     { key: 'blockGrid', name: 'Block grid', isOn: () => overlayState.blockGrid, onToggle: () => {
       overlayState.blockGrid = !overlayState.blockGrid;
@@ -271,6 +280,26 @@ async function boot(): Promise<void> {
 
   const layersPopover = new LayersPopover(layerDefs, chrome);
   chrome.appendChild(layersPopover.root);
+
+  // Only styles the server actually offers are listed, and only ones this
+  // client knows how to describe -- an unrecognised style from a newer server
+  // still gets an entry rather than being silently dropped, since the server
+  // can render it perfectly well without the client having a label for it.
+  const STYLE_LABELS: Record<string, { name: string; hint: string }> = {
+    terrain: { name: 'Terrain', hint: 'Natural block colours and relief shading' },
+    biome: { name: 'Biome', hint: 'A flat colour per biome, for reading biome layout' },
+    height: { name: 'Height', hint: 'An elevation gradient, for reading terrain relief' },
+    light: { name: 'Mob spawns', hint: 'Red where block light is 0 and hostile mobs can spawn after dark' },
+    ore: { name: 'Ores', hint: 'Each column coloured by the most valuable ore beneath it' },
+  };
+  layersPopover.setStyles(
+    config.styles.map((id) => ({ id, ...(STYLE_LABELS[id] ?? { name: id, hint: id }) })),
+    engine.getStyle(),
+    (style) => {
+      engine.setStyle(style);
+      flashLoading();
+    },
+  );
 
   /** Single place that flips the chunk-grid flag, so the Layers toggle, the
    * 'g' shortcut and selection mode (which also shows the grid) never drift
@@ -699,7 +728,6 @@ async function boot(): Promise<void> {
   chrome.appendChild(hotbar.root);
 
   function goToSpawn(): void {
-    players.stopFollowing();
     const d = engine.getDimension();
     engine.centerOnBlock(d.spawnX, d.spawnZ);
     flashLoading();
@@ -829,21 +857,25 @@ async function boot(): Promise<void> {
   }
   updateSliceLabel();
 
-  // Debounced because a sliced tile is rendered on demand from voxel data:
-  // applying every intermediate value of a drag would queue hundreds of
-  // renders and leave the level the user actually chose stuck behind them.
-  let sliceTimer: number | null = null;
-  sliceInput.addEventListener('input', () => {
-    updateSliceLabel();
-    if (sliceTimer !== null) window.clearTimeout(sliceTimer);
-    sliceTimer = window.setTimeout(() => {
-      sliceTimer = null;
-      const y = Number(sliceInput.value);
-      // At or above the ceiling nothing is cut away, so drop the slice
-      // entirely and let the view go back to the ordinary stored tiles.
-      engine.setSliceY(y >= engine.getDimension().maxY ? null : y);
-      flashLoading();
-    }, SLICE_DEBOUNCE_MS);
+  // The label pulses for as long as the iso source actually has tile
+  // requests in flight, rather than a fixed-duration flash -- a cold sliced
+  // tile can take seconds (PERF_PLAN.md §1), and a flash timed for the common
+  // case would read as broken on the slow one.
+  engine.on('isoLoading', (loading) => {
+    sliceLabel.classList.toggle('mm-loading', loading);
+  });
+
+  // "input" fires continuously while dragging -- cheap enough to update the
+  // label live -- but the render itself only applies on "change" (release, or
+  // a single arrow-key step), so a drag costs exactly one render pass instead
+  // of one per intermediate level or one after a settle delay.
+  sliceInput.addEventListener('input', updateSliceLabel);
+  sliceInput.addEventListener('change', () => {
+    const y = Number(sliceInput.value);
+    // At or above the ceiling nothing is cut away, so drop the slice
+    // entirely and let the view go back to the ordinary stored tiles.
+    engine.setSliceY(y >= engine.getDimension().maxY ? null : y);
+    flashLoading();
   });
 
   // Re-range the slider when the dimension changes: the Nether's ceiling and a
@@ -996,22 +1028,16 @@ async function boot(): Promise<void> {
 
     // A player marker (icon or its nametag -- OpenLayers hit-tests text the
     // same as any other style component) takes priority over both selection
-    // and picking: clicking one means "follow this player", which jumps the
-    // view to them immediately rather than waiting for their next position
-    // update to quietly recentre.
+    // and picking: clicking one jumps the view to them once, the same as
+    // picking a player from search, rather than locking the camera to them.
     const pixel = engine.map.getPixelFromCoordinate(c);
     const hitPlayer = pixel ? players.hitTest(pixel) : null;
     if (hitPlayer) {
-      const following = players.toggleFollow(hitPlayer.uuid);
       searchBar.clear();
-      if (following) {
-        // Close enough to actually see them, not just "somewhere in view".
-        const zoom = Math.max(engine.zoom(), FOLLOW_ZOOM);
-        engine.setZoom(zoom, true);
-        engine.centerOnBlock(hitPlayer.x, hitPlayer.z, hitPlayer.y);
-      } else {
-        engine.map.render();
-      }
+      // Close enough to actually see them, not just "somewhere in view".
+      const zoom = Math.max(engine.zoom(), FOLLOW_ZOOM);
+      engine.setZoom(zoom, true);
+      engine.centerOnBlock(hitPlayer.x, hitPlayer.z, hitPlayer.y);
       return;
     }
 
@@ -1066,7 +1092,6 @@ async function boot(): Promise<void> {
   searchBar.setHandlers({
     onQuery: (q) => api.search(engine.getDimension().id, q),
     onPick: (r) => {
-      players.stopFollowing();
       if (r.dimension && r.dimension !== engine.getDimension().id) {
         const target = config.dimensions.find((d) => d.id === r.dimension);
         if (target) {
@@ -1107,9 +1132,7 @@ async function boot(): Promise<void> {
     } else if (e.key === 'm') {
       void switchMode(engine.getMode() === 'top' ? 'iso' : 'top');
     } else if (e.key === 'Escape') {
-      if (players.isFollowing()) {
-        players.stopFollowing();
-      } else if (contextMenu.isOpen()) {
+      if (contextMenu.isOpen()) {
         contextMenu.close();
       } else if (layersPopover.isVisible()) {
         layersPopover.setVisible(false);

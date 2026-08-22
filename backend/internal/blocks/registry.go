@@ -204,9 +204,14 @@ func (r *Registry) LoadBlocksJSON(raw []byte) (int, error) {
 		if err != nil {
 			return n, fmt.Errorf("block %q: %w", name, err)
 		}
+		// An explicit height always wins; otherwise the name is consulted, so
+		// a listed-but-heightless "spruce_stairs" is still half a block
+		// rather than silently a full cube.
 		h := float32(1)
 		if e.Height != nil {
 			h = *e.Height
+		} else if inferred, ok := InferHeight(name); ok {
+			h = inferred
 		}
 		b := Block{
 			Name:        normalize(name),
@@ -276,6 +281,12 @@ func (r *Registry) ID(name string) uint16 {
 		Color:  r.fallback(key),
 		Height: 1,
 		Known:  false,
+	}
+	// A modpack adds hundreds of stair, slab and carpet variants that
+	// blocks.json will never list one by one; their names still say what
+	// shape they are (see InferHeight).
+	if h, ok := InferHeight(key); ok {
+		b.Height = h
 	}
 	if r.classifyDecoration != nil && r.classifyDecoration(key) {
 		b.Transparent = true
